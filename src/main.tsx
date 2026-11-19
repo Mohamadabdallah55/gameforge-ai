@@ -1,38 +1,485 @@
-import React,{useEffect,useState} from 'react';
-import {createRoot} from 'react-dom/client';
-import {fields,levels,type Asset,type Profile,type Plan,type Question} from '../shared/contracts';
-import type {Job} from '../server/store';
-import {api} from './api';
-import {base64,frame} from './media';
-import './style.css';
-const labels={easy:'سهل',medium:'متوسط',hard:'صعب',imagePercent:'نسبة الأسئلة المصوّرة ٪'};
-const statuses={queued:'في الانتظار',running:'قيد الإنتاج',failed:'توقفت',complete:'مكتملة'};
-function Studio(){
- const [profile,P]=useState('default'),[profiles,Ps]=useState<(Profile&{id:string})[]>([]),[jobs,J]=useState<Job[]>([]),[questions,Q]=useState<Question[]>([]),[assets,A]=useState<Asset[]>([]);
- const [tab,T]=useState('الإنتاج'),[msg,M]=useState(''),[busy,B]=useState(false),[configured,C]=useState(false);
- const [plan,S]=useState<Plan>({topic:'',easy:2,medium:2,hard:1,imagePercent:0}),[request,R]=useState('');
- const [name,N]=useState(''),[rules,U]=useState(''),[mapping,Y]=useState<Profile['mapping']>({}),[columns,K]=useState<string[]>([]);
- const [file,F]=useState<File>(),[rights,H]=useState(false),[credit,G]=useState(''),[time,D]=useState(0),[asset,I]=useState(''),[style,L]=useState('sketch'),[prompt,O]=useState('');
- const [query,V]=useState(''),[hits,X]=useState<{title:string;url:string;origin?:string;text?:string}[]>([]);
- async function act(fn:()=>Promise<void>){if(busy)return;B(true);M('');try{await fn()}catch(e){M(e instanceof Error?e.message:String(e))}finally{B(false)}}
- useEffect(()=>{let alive=true;let timer:ReturnType<typeof setTimeout>;async function refresh(){try{const [p,j,q,a,h]=await Promise.all([api('profiles'),api('jobs'),api('questions?profileId='+profile),api('assets'),api('health')]);if(alive){Ps(p);J(j);Q(q);A(a);C(h.geminiConfigured)}}catch(e){if(alive)M(String(e))}finally{if(alive)timer=setTimeout(refresh,2500)}}void refresh();return()=>{alive=false;clearTimeout(timer)}},[profile]);
- const button=(label:string,fn:()=>Promise<void>,disabled=false)=><button disabled={busy||disabled} onClick={()=>void act(fn)}>{label}</button>;
- return <main><header><h1>GameForge AI</h1><span>{configured?'مفتاح Gemini مضبوط':'أضف GEMINI_API_KEY لتشغيل التوليد'}</span></header>
- <label>اللعبة <select value={profile} onChange={e=>P(e.target.value)}>{profiles.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
- <nav>{['الإنتاج','المكتبة','الوسائط','بحث','ملفات الألعاب'].map(t=><button key={t} aria-pressed={t===tab} onClick={()=>{T(t);M('')}}>{t}</button>)}</nav>
- {msg&&<p role="status">{msg}</p>}
- {tab==='الإنتاج'&&<><section><h2>خطة الأسئلة</h2><label>الطلب بالعربية<textarea value={request} placeholder="عشرة أسئلة عن كأس العالم 2022، نصفها بصور" onChange={e=>R(e.target.value)}/></label>{button('تحليل الطلب',async()=>S(await api('interpret',{request})),!request)}
- <label>الموضوع والموسم أو البطولة<input value={plan.topic} onChange={e=>S({...plan,topic:e.target.value})}/></label>
- <div className="row">{([...levels,'imagePercent'] as const).map(k=><label key={k}>{labels[k]}<input type="number" min="0" max="100" value={plan[k]} onChange={e=>S({...plan,[k]:Number(e.target.value)})}/></label>)}</div>
- {button('بدء مهمة إنتاج',async()=>{const j=await api<Job>('jobs',{profileId:profile,plan});J(s=>[...s.filter(v=>v.id!==j.id),j]);M('أُضيفت المهمة')},!plan.topic.trim())}</section>
- <section><h2>المهام</h2>{jobs.filter(j=>j.profileId===profile).reverse().map(j=><article key={j.id}><strong>{j.plan.topic}</strong> · {statuses[j.status]} · {j.done}/{j.plan.easy+j.plan.medium+j.plan.hard}{j.error&&<p>{j.error}</p>}{j.status==='failed'&&button('استئناف من آخر سؤال',async()=>{await api('jobs/'+j.id+'/retry',{});M('أُعيدت جدولة المهمة')})}</article>)}</section></>}
- {tab==='المكتبة'&&<section><h2>مكتبة الأسئلة ({questions.length})</h2><div className="row">{['json','csv','xlsx','zip'].map(f=><a key={f} href={'/api/export/'+f+'?profileId='+profile}>تنزيل {f.toUpperCase()}</a>)}</div>{questions.map(q=><article key={q.id}><strong>{q.question}</strong><p>{q.answer} · {labels[q.difficulty]}</p>{q.image&&<img src={'/api/assets/'+q.image} alt="صورة السؤال"/>}<details><summary>دليل الإجابة</summary><p>{q.quote}</p><a href={q.source} target="_blank" rel="noreferrer">المصدر</a></details></article>)}</section>}
- {tab==='الوسائط'&&<><section><h2>إضافة صورة أو إطار فيديو</h2><input aria-label="ملف الوسائط" type="file" accept="image/*,video/*" onChange={e=>F(e.target.files?.[0])}/>{file?.type.startsWith('video/')&&<label>الثانية<input type="number" min="0" step=".1" value={time} onChange={e=>D(Number(e.target.value))}/></label>}<label>صاحب الصورة أو المقطع<input value={credit} onChange={e=>G(e.target.value)}/></label><label><input type="checkbox" checked={rights} onChange={e=>H(e.target.checked)}/> لدي إذن الاستخدام</label>{button('حفظ في المكتبة',async()=>{if(!file)return;const video=file.type.startsWith('video/');const a=await api('assets',{data:await base64(video?await frame(file,time):file),rights,credit,origin:video?file.name+' @ '+time+'s':file.name});I(a.id);A(await api('assets'));M('حُفظت الصورة')},!file||!rights||!credit)}</section>
- <section><h2>معالجة الصور</h2><label>الصورة الأصلية<select value={asset} onChange={e=>I(e.target.value)}><option value="">توليد صورة جديدة</option>{assets.map(a=><option key={a.id} value={a.id}>{a.origin} · {a.id.slice(0,6)}</option>)}</select></label>{asset&&<img src={'/api/assets/'+asset} alt="الصورة المحددة"/>}<label>التأثير المحلي<select value={style} onChange={e=>L(e.target.value)}>{Object.entries({sketch:'رسم بالقلم',bw:'أبيض وأسود',silhouette:'ظل',cartoon:'كرتون'}).map(([v,n])=><option key={v} value={v}>{n}</option>)}</select></label>{button('تطبيق التأثير',async()=>{const a=await api('assets/transform',{assetId:asset,style});A(await api('assets'));I(a.id)},!asset)}
- <label>وصف التوليد أو التعديل<textarea value={prompt} onChange={e=>O(e.target.value)}/></label>{button('تنفيذ باستخدام Gemini',async()=>{const a=await api('assets/generate',{prompt,assetId:asset||undefined});A(await api('assets'));I(a.id)},!prompt)}</section></>}
- {tab==='بحث'&&<section><h2>بحث المصادر والصور</h2><label>عبارة البحث<input value={query} onChange={e=>V(e.target.value)}/></label>{['facts','images'].map(k=><React.Fragment key={k}>{button(k==='facts'?'معلومات':'صور حقيقية',async()=>{const rs=await api('search?kind='+k+'&q='+encodeURIComponent(query));X(rs);if(!rs.length)M('لم تظهر نتائج')},!query)}</React.Fragment>)}{hits.map(h=><article key={h.url}><a href={h.origin||h.url} target="_blank" rel="noreferrer">{h.title}</a>{h.origin?<img src={h.url} alt={h.title}/>:<p>{h.text?.slice(0,300)}</p>}</article>)}</section>}
- {tab==='ملفات الألعاب'&&<section><h2>ملف لعبة جديد</h2><label>اسم اللعبة<input value={name} onChange={e=>N(e.target.value)}/></label><label>قواعد صياغة الأسئلة<textarea value={rules} onChange={e=>U(e.target.value)}/></label>
- <label>استنتاج حقول نموذج JSON أو CSV أو Excel<input type="file" accept=".json,.csv,.xlsx" onChange={e=>{const f=e.target.files?.[0];if(f)void act(async()=>{const t=await api('templates/infer',{format:f.name.split('.').pop()?.toLowerCase(),data:await base64(f)});Y(t.mapping);K(t.columns.map((c:{name:string})=>c.name));M('عدد سجلات النموذج '+t.rows)})}}/></label>
- {fields.map(k=><label key={k}>{({question:'السؤال',answer:'الإجابة',image:'مسار الصورة',difficulty:'الصعوبة',source:'المصدر'})[k]}<input list="columns" value={mapping[k]??k} onChange={e=>Y({...mapping,[k]:e.target.value})}/></label>)}<datalist id="columns">{columns.map(c=><option key={c} value={c}/>)}</datalist>{button('إنشاء ملف اللعبة',async()=>{const p=await api('profiles',{name,rules,mapping});Ps(await api('profiles'));P(p.id);N('');T('الإنتاج')},!name.trim())}</section>}</main>
+import React, { useEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  fields,
+  levels,
+  type Asset,
+  type Profile,
+  type Plan,
+  type Question,
+} from "../shared/contracts";
+import type { Job } from "../shared/contracts";
+import { api } from "./api";
+import { base64, frame } from "./media";
+import "./style.css";
+const labels = {
+  easy: "سهل",
+  medium: "متوسط",
+  hard: "صعب",
+  imagePercent: "نسبة الأسئلة المصوّرة ٪",
+};
+const statuses = {
+  queued: "في الانتظار",
+  running: "قيد الإنتاج",
+  failed: "توقفت",
+  complete: "مكتملة",
+};
+function Studio() {
+  const [profile, P] = useState("default"),
+    [profiles, Ps] = useState<(Profile & { id: string })[]>([]),
+    [jobs, J] = useState<Job[]>([]),
+    [questions, Q] = useState<Question[]>([]),
+    [assets, A] = useState<Asset[]>([]);
+  const [tab, T] = useState("الإنتاج"),
+    [msg, M] = useState(""),
+    [busy, B] = useState(false),
+    [configured, C] = useState(false);
+  const [plan, S] = useState<Plan>({
+      topic: "",
+      easy: 2,
+      medium: 2,
+      hard: 1,
+      imagePercent: 0,
+    }),
+    [request, R] = useState("");
+  const [name, N] = useState(""),
+    [rules, U] = useState(""),
+    [mapping, Y] = useState<Profile["mapping"]>({}),
+    [columns, K] = useState<string[]>([]);
+  const [file, F] = useState<File>(),
+    [rights, H] = useState(false),
+    [credit, G] = useState(""),
+    [time, D] = useState(0),
+    [asset, I] = useState(""),
+    [style, L] = useState("sketch"),
+    [prompt, O] = useState("");
+  const [query, V] = useState(""),
+    [hits, X] = useState<
+      { title: string; url: string; origin?: string; text?: string }[]
+    >([]);
+  async function act(fn: () => Promise<void>) {
+    if (busy) return;
+    B(true);
+    M("");
+    try {
+      await fn();
+    } catch (e) {
+      M(e instanceof Error ? e.message : String(e));
+    } finally {
+      B(false);
+    }
+  }
+  useEffect(() => {
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout>;
+    async function refresh() {
+      try {
+        const [p, j, q, a, h] = await Promise.all([
+          api("profiles"),
+          api("jobs"),
+          api("questions?profileId=" + profile),
+          api("assets"),
+          api("health"),
+        ]);
+        if (alive) {
+          Ps(p);
+          J(j);
+          Q(q);
+          A(a);
+          C(h.geminiConfigured);
+        }
+      } catch (e) {
+        if (alive) M(String(e));
+      } finally {
+        if (alive) timer = setTimeout(refresh, 2500);
+      }
+    }
+    void refresh();
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+    };
+  }, [profile]);
+  const button = (label: string, fn: () => Promise<void>, disabled = false) => (
+    <button disabled={busy || disabled} onClick={() => void act(fn)}>
+      {label}
+    </button>
+  );
+  return (
+    <main>
+      <header>
+        <h1>GameForge AI</h1>
+        <span>
+          {configured
+            ? "مفتاح Gemini مضبوط"
+            : "أضف GEMINI_API_KEY لتشغيل التوليد"}
+        </span>
+      </header>
+      <label>
+        اللعبة{" "}
+        <select value={profile} onChange={(e) => P(e.target.value)}>
+          {profiles.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <nav>
+        {["الإنتاج", "المكتبة", "الوسائط", "بحث", "ملفات الألعاب"].map((t) => (
+          <button
+            key={t}
+            aria-pressed={t === tab}
+            onClick={() => {
+              T(t);
+              M("");
+            }}
+          >
+            {t}
+          </button>
+        ))}
+      </nav>
+      {msg && <p role="status">{msg}</p>}
+      {tab === "الإنتاج" && (
+        <>
+          <section>
+            <h2>خطة الأسئلة</h2>
+            <label>
+              الطلب بالعربية
+              <textarea
+                value={request}
+                placeholder="عشرة أسئلة عن كأس العالم 2022، نصفها بصور"
+                onChange={(e) => R(e.target.value)}
+              />
+            </label>
+            {button(
+              "تحليل الطلب",
+              async () => S(await api("interpret", { request })),
+              !request,
+            )}
+            <label>
+              الموضوع والموسم أو البطولة
+              <input
+                value={plan.topic}
+                onChange={(e) => S({ ...plan, topic: e.target.value })}
+              />
+            </label>
+            <div className="row">
+              {([...levels, "imagePercent"] as const).map((k) => (
+                <label key={k}>
+                  {labels[k]}
+                  <input
+                    type="number"
+                    min="0"
+                    max="100"
+                    value={plan[k]}
+                    onChange={(e) =>
+                      S({ ...plan, [k]: Number(e.target.value) })
+                    }
+                  />
+                </label>
+              ))}
+            </div>
+            {button(
+              "بدء مهمة إنتاج",
+              async () => {
+                const j = await api<Job>("jobs", { profileId: profile, plan });
+                J((s) => [...s.filter((v) => v.id !== j.id), j]);
+                M("أُضيفت المهمة");
+              },
+              !plan.topic.trim(),
+            )}
+          </section>
+          <section>
+            <h2>المهام</h2>
+            {jobs
+              .filter((j) => j.profileId === profile)
+              .reverse()
+              .map((j) => (
+                <article key={j.id}>
+                  <strong>{j.plan.topic}</strong> · {statuses[j.status]} ·{" "}
+                  {j.done}/{j.plan.easy + j.plan.medium + j.plan.hard}
+                  {j.error && <p>{j.error}</p>}
+                  {j.status === "failed" &&
+                    button("استئناف من آخر سؤال", async () => {
+                      await api("jobs/" + j.id + "/retry", {});
+                      M("أُعيدت جدولة المهمة");
+                    })}
+                </article>
+              ))}
+          </section>
+        </>
+      )}
+      {tab === "المكتبة" && (
+        <section>
+          <h2>مكتبة الأسئلة ({questions.length})</h2>
+          <div className="row">
+            {["json", "csv", "xlsx", "zip"].map((f) => (
+              <a key={f} href={"/api/export/" + f + "?profileId=" + profile}>
+                تنزيل {f.toUpperCase()}
+              </a>
+            ))}
+          </div>
+          {questions.map((q) => (
+            <article key={q.id}>
+              <strong>{q.question}</strong>
+              <p>
+                {q.answer} · {labels[q.difficulty]}
+              </p>
+              {q.image && (
+                <img src={"/api/assets/" + q.image} alt="صورة السؤال" />
+              )}
+              <label>
+                صورة السؤال
+                <select
+                  value={q.image || ""}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const assetId = e.target.value || null;
+                    void act(async () => {
+                      await api("questions/" + q.id + "/image", {
+                        profileId: profile,
+                        assetId,
+                      });
+                      Q(await api("questions?profileId=" + profile));
+                    });
+                  }}
+                >
+                  <option value="">بدون صورة</option>
+                  {assets.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.origin} · {a.id.slice(0, 6)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <details>
+                <summary>دليل الإجابة</summary>
+                <p>{q.quote}</p>
+                <a href={q.source} target="_blank" rel="noreferrer">
+                  المصدر
+                </a>
+              </details>
+            </article>
+          ))}
+        </section>
+      )}
+      {tab === "الوسائط" && (
+        <>
+          <section>
+            <h2>إضافة صورة أو إطار فيديو</h2>
+            <input
+              aria-label="ملف الوسائط"
+              type="file"
+              accept="image/*,video/*"
+              onChange={(e) => F(e.target.files?.[0])}
+            />
+            {file?.type.startsWith("video/") && (
+              <label>
+                الثانية
+                <input
+                  type="number"
+                  min="0"
+                  step=".1"
+                  value={time}
+                  onChange={(e) => D(Number(e.target.value))}
+                />
+              </label>
+            )}
+            <label>
+              صاحب الصورة أو المقطع
+              <input value={credit} onChange={(e) => G(e.target.value)} />
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={rights}
+                onChange={(e) => H(e.target.checked)}
+              />{" "}
+              لدي إذن الاستخدام
+            </label>
+            {button(
+              "حفظ في المكتبة",
+              async () => {
+                if (!file) return;
+                const video = file.type.startsWith("video/");
+                const a = await api("assets", {
+                  data: await base64(video ? await frame(file, time) : file),
+                  rights,
+                  credit,
+                  origin: video ? file.name + " @ " + time + "s" : file.name,
+                });
+                I(a.id);
+                A(await api("assets"));
+                M("حُفظت الصورة");
+              },
+              !file || !rights || !credit,
+            )}
+          </section>
+          <section>
+            <h2>معالجة الصور</h2>
+            <label>
+              الصورة الأصلية
+              <select value={asset} onChange={(e) => I(e.target.value)}>
+                <option value="">توليد صورة جديدة</option>
+                {assets.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.origin} · {a.id.slice(0, 6)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {asset && <img src={"/api/assets/" + asset} alt="الصورة المحددة" />}
+            <label>
+              التأثير المحلي
+              <select value={style} onChange={(e) => L(e.target.value)}>
+                {Object.entries({
+                  sketch: "رسم بالقلم",
+                  bw: "أبيض وأسود",
+                  silhouette: "ظل",
+                  cartoon: "كرتون",
+                }).map(([v, n]) => (
+                  <option key={v} value={v}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {button(
+              "تطبيق التأثير",
+              async () => {
+                const a = await api("assets/transform", {
+                  assetId: asset,
+                  style,
+                });
+                A(await api("assets"));
+                I(a.id);
+              },
+              !asset,
+            )}
+            <label>
+              وصف التوليد أو التعديل
+              <textarea value={prompt} onChange={(e) => O(e.target.value)} />
+            </label>
+            {button(
+              "تنفيذ باستخدام Gemini",
+              async () => {
+                const a = await api("assets/generate", {
+                  prompt,
+                  assetId: asset || undefined,
+                });
+                A(await api("assets"));
+                I(a.id);
+              },
+              !prompt,
+            )}
+          </section>
+        </>
+      )}
+      {tab === "بحث" && (
+        <section>
+          <h2>بحث المصادر والصور</h2>
+          <label>
+            عبارة البحث
+            <input value={query} onChange={(e) => V(e.target.value)} />
+          </label>
+          {["facts", "images"].map((k) => (
+            <React.Fragment key={k}>
+              {button(
+                k === "facts" ? "معلومات" : "صور حقيقية",
+                async () => {
+                  const rs = await api(
+                    "search?kind=" + k + "&q=" + encodeURIComponent(query),
+                  );
+                  X(rs);
+                  if (!rs.length) M("لم تظهر نتائج");
+                },
+                !query,
+              )}
+            </React.Fragment>
+          ))}
+          {hits.map((h) => (
+            <article key={h.url}>
+              <a href={h.origin || h.url} target="_blank" rel="noreferrer">
+                {h.title}
+              </a>
+              {h.origin ? (
+                <img src={h.url} alt={h.title} />
+              ) : (
+                <p>{h.text?.slice(0, 300)}</p>
+              )}
+            </article>
+          ))}
+        </section>
+      )}
+      {tab === "ملفات الألعاب" && (
+        <section>
+          <h2>ملف لعبة جديد</h2>
+          <label>
+            اسم اللعبة
+            <input value={name} onChange={(e) => N(e.target.value)} />
+          </label>
+          <label>
+            قواعد صياغة الأسئلة
+            <textarea value={rules} onChange={(e) => U(e.target.value)} />
+          </label>
+          <label>
+            استنتاج حقول نموذج JSON أو CSV أو Excel
+            <input
+              type="file"
+              accept=".json,.csv,.xlsx"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f)
+                  void act(async () => {
+                    const t = await api("templates/infer", {
+                      format: f.name.split(".").pop()?.toLowerCase(),
+                      data: await base64(f),
+                    });
+                    Y(t.mapping);
+                    K(t.columns.map((c: { name: string }) => c.name));
+                    M("عدد سجلات النموذج " + t.rows);
+                  });
+              }}
+            />
+          </label>
+          {fields.map((k) => (
+            <label key={k}>
+              {
+                {
+                  question: "السؤال",
+                  answer: "الإجابة",
+                  image: "مسار الصورة",
+                  difficulty: "الصعوبة",
+                  source: "المصدر",
+                }[k]
+              }
+              <input
+                list="columns"
+                value={mapping[k] ?? k}
+                onChange={(e) => Y({ ...mapping, [k]: e.target.value })}
+              />
+            </label>
+          ))}
+          <datalist id="columns">
+            {columns.map((c) => (
+              <option key={c} value={c} />
+            ))}
+          </datalist>
+          {button(
+            "إنشاء ملف اللعبة",
+            async () => {
+              const p = await api("profiles", { name, rules, mapping });
+              Ps(await api("profiles"));
+              P(p.id);
+              N("");
+              T("الإنتاج");
+            },
+            !name.trim(),
+          )}
+        </section>
+      )}
+    </main>
+  );
 }
-createRoot(document.getElementById('root')!).render(<Studio/>);
+createRoot(document.getElementById("root")!).render(<Studio />);
