@@ -1,485 +1,545 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  fields,
-  levels,
-  type Asset,
-  type Profile,
-  type Plan,
-  type Question,
-} from "../shared/contracts";
-import type { Job } from "../shared/contracts";
+  Bot,
+  BookOpen,
+  Gamepad2,
+  Image as ImageIcon,
+  Layers,
+  Menu,
+  Search,
+  ShieldCheck,
+  X,
+} from "lucide-react";
 import { api } from "./api";
-import { base64, frame } from "./media";
+import { AssistantDrawer } from "./components/AssistantDrawer";
+import { AuditCenter } from "./components/AuditCenter";
+import { MediaLab } from "./components/MediaLab";
+import { ProductionStudio } from "./components/ProductionStudio";
+import { ProfilesAndExport } from "./components/ProfilesAndExport";
+import { QuestionLibrary } from "./components/QuestionLibrary";
+import { ResearchHub } from "./components/ResearchHub";
 import "./style.css";
-const labels = {
-  easy: "سهل",
-  medium: "متوسط",
-  hard: "صعب",
-  imagePercent: "نسبة الأسئلة المصوّرة ٪",
-};
-const statuses = {
-  queued: "في الانتظار",
-  running: "قيد الإنتاج",
-  failed: "توقفت",
-  complete: "مكتملة",
-};
+import type {
+  Asset,
+  AssistantMessage,
+  CopilotTurnResponse,
+  ExportPreview,
+  HealthStatus,
+  Job,
+  Plan,
+  Profile,
+  Question,
+  TabKey,
+} from "./types";
+
+const NAV_ITEMS: { key: TabKey; label: string; icon: React.ComponentType<any> }[] = [
+  { key: "production", label: "الإنتاج", icon: Layers },
+  { key: "library", label: "المكتبة", icon: BookOpen },
+  { key: "media", label: "الوسائط", icon: ImageIcon },
+  { key: "search", label: "بحث", icon: Search },
+  { key: "audit", label: "التدقيق", icon: ShieldCheck },
+  { key: "profiles", label: "ملفات الألعاب", icon: Gamepad2 },
+];
+
 function Studio() {
-  const [profile, P] = useState("default"),
-    [profiles, Ps] = useState<(Profile & { id: string })[]>([]),
-    [jobs, J] = useState<Job[]>([]),
-    [questions, Q] = useState<Question[]>([]),
-    [assets, A] = useState<Asset[]>([]);
-  const [tab, T] = useState("الإنتاج"),
-    [msg, M] = useState(""),
-    [busy, B] = useState(false),
-    [configured, C] = useState(false);
-  const [plan, S] = useState<Plan>({
-      topic: "",
-      easy: 2,
-      medium: 2,
-      hard: 1,
-      imagePercent: 0,
-    }),
-    [request, R] = useState("");
-  const [name, N] = useState(""),
-    [rules, U] = useState(""),
-    [mapping, Y] = useState<Profile["mapping"]>({}),
-    [columns, K] = useState<string[]>([]);
-  const [file, F] = useState<File>(),
-    [rights, H] = useState(false),
-    [credit, G] = useState(""),
-    [time, D] = useState(0),
-    [asset, I] = useState(""),
-    [style, L] = useState("sketch"),
-    [prompt, O] = useState("");
-  const [query, V] = useState(""),
-    [hits, X] = useState<
-      { title: string; url: string; origin?: string; text?: string }[]
-    >([]);
-  async function act(fn: () => Promise<void>) {
-    if (busy) return;
-    B(true);
-    M("");
-    try {
-      await fn();
-    } catch (e) {
-      M(e instanceof Error ? e.message : String(e));
-    } finally {
-      B(false);
-    }
-  }
+  const [profileId, setProfileId] = useState("default");
+  const [profiles, setProfiles] = useState<(Profile & { id: string })[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [assistantMessages, setAssistantMessages] = useState<
+    AssistantMessage[]
+  >([]);
+
+  const [tab, setTab] = useState<TabKey>("production");
+  const [selectedAssetId, setSelectedAssetId] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  const refreshNow = useCallback(async (pid = profileId) => {
+    const [p, j, q, a, h, ah] = await Promise.all([
+      api("profiles"),
+      api("jobs"),
+      api("questions?profileId=" + pid),
+      api("assets"),
+      api("health"),
+      api("assistant/history?profileId=" + pid),
+    ]);
+    setProfiles(p);
+    setJobs(j);
+    setQuestions(q);
+    setAssets(a);
+    setHealth(h);
+    setAssistantMessages(ah);
+  }, [profileId]);
+
   useEffect(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout>;
-    async function refresh() {
+    async function loop() {
       try {
-        const [p, j, q, a, h] = await Promise.all([
-          api("profiles"),
-          api("jobs"),
-          api("questions?profileId=" + profile),
-          api("assets"),
-          api("health"),
-        ]);
-        if (alive) {
-          Ps(p);
-          J(j);
-          Q(q);
-          A(a);
-          C(h.geminiConfigured);
-        }
+        await refreshNow(profileId);
       } catch (e) {
-        if (alive) M(String(e));
+        if (alive) setMsg(e instanceof Error ? e.message : String(e));
       } finally {
-        if (alive) timer = setTimeout(refresh, 2500);
+        if (alive) timer = setTimeout(loop, 2500);
       }
     }
-    void refresh();
+    void loop();
     return () => {
       alive = false;
       clearTimeout(timer);
     };
-  }, [profile]);
-  const button = (label: string, fn: () => Promise<void>, disabled = false) => (
-    <button disabled={busy || disabled} onClick={() => void act(fn)}>
-      {label}
-    </button>
-  );
+  }, [profileId, refreshNow]);
+
+  async function act<T>(fn: () => Promise<T>): Promise<T> {
+    if (busy) throw new Error("توجد عملية جارية بالفعل");
+    setBusy(true);
+    setMsg("");
+    try {
+      return await fn();
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      setMsg(m);
+      throw e;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const configured = Boolean(health?.geminiConfigured);
+  const activeProfile = profiles.find((p) => p.id === profileId);
+
   return (
-    <main>
-      <header>
-        <h1>GameForge AI</h1>
-        <span>
-          {configured
-            ? "مفتاح Gemini مضبوط"
-            : "أضف GEMINI_API_KEY لتشغيل التوليد"}
-        </span>
-      </header>
-      <label>
-        اللعبة{" "}
-        <select value={profile} onChange={(e) => P(e.target.value)}>
-          {profiles.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <nav>
-        {["الإنتاج", "المكتبة", "الوسائط", "بحث", "ملفات الألعاب"].map((t) => (
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
+      {/* 3-Zone Top Bar */}
+      <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-4 lg:px-8 h-16 flex items-center justify-between gap-8">
+        <div className="flex items-center gap-3 shrink-0">
           <button
-            key={t}
-            aria-pressed={t === tab}
-            onClick={() => {
-              T(t);
-              M("");
-            }}
+            type="button"
+            aria-label="فتح القائمة"
+            onClick={() => setMobileNavOpen(!mobileNavOpen)}
+            className="lg:hidden p-1.5 text-slate-700 hover:bg-slate-100 rounded"
           >
-            {t}
+            {mobileNavOpen ? (
+              <X className="w-5 h-5" />
+            ) : (
+              <Menu className="w-5 h-5" />
+            )}
           </button>
-        ))}
-      </nav>
-      {msg && <p role="status">{msg}</p>}
-      {tab === "الإنتاج" && (
-        <>
-          <section>
-            <h2>خطة الأسئلة</h2>
-            <label>
-              الطلب بالعربية
-              <textarea
-                value={request}
-                placeholder="عشرة أسئلة عن كأس العالم 2022، نصفها بصور"
-                onChange={(e) => R(e.target.value)}
-              />
-            </label>
-            {button(
-              "تحليل الطلب",
-              async () => S(await api("interpret", { request })),
-              !request,
-            )}
-            <label>
-              الموضوع والموسم أو البطولة
-              <input
-                value={plan.topic}
-                onChange={(e) => S({ ...plan, topic: e.target.value })}
-              />
-            </label>
-            <div className="row">
-              {([...levels, "imagePercent"] as const).map((k) => (
-                <label key={k}>
-                  {labels[k]}
-                  <input
-                    type="number"
-                    min="0"
-                    max="100"
-                    value={plan[k]}
-                    onChange={(e) =>
-                      S({ ...plan, [k]: Number(e.target.value) })
-                    }
-                  />
-                </label>
+          <h1
+            dir="ltr"
+            className="text-xl font-extrabold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
+          >
+            GameForge AI
+          </h1>
+        </div>
+
+        <div className="hidden md:flex items-center gap-4 text-xs text-slate-600 min-w-0">
+          <label className="flex items-center gap-2 whitespace-nowrap">
+            <span className="font-medium text-slate-700">اللعبة</span>
+            <select
+              value={profileId}
+              onChange={(e) => setProfileId(e.target.value)}
+              className="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-900 focus:border-emerald-800 focus:outline-none"
+            >
+              {profiles.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
               ))}
-            </div>
-            {button(
-              "بدء مهمة إنتاج",
-              async () => {
-                const j = await api<Job>("jobs", { profileId: profile, plan });
-                J((s) => [...s.filter((v) => v.id !== j.id), j]);
-                M("أُضيفت المهمة");
-              },
-              !plan.topic.trim(),
-            )}
-          </section>
-          <section>
-            <h2>المهام</h2>
-            {jobs
-              .filter((j) => j.profileId === profile)
-              .reverse()
-              .map((j) => (
-                <article key={j.id}>
-                  <strong>{j.plan.topic}</strong> · {statuses[j.status]} ·{" "}
-                  {j.done}/{j.plan.easy + j.plan.medium + j.plan.hard}
-                  {j.error && <p>{j.error}</p>}
-                  {j.status === "failed" &&
-                    button("استئناف من آخر سؤال", async () => {
-                      await api("jobs/" + j.id + "/retry", {});
-                      M("أُعيدت جدولة المهمة");
-                    })}
-                </article>
-              ))}
-          </section>
-        </>
-      )}
-      {tab === "المكتبة" && (
-        <section>
-          <h2>مكتبة الأسئلة ({questions.length})</h2>
-          <div className="row">
-            {["json", "csv", "xlsx", "zip"].map((f) => (
-              <a key={f} href={"/api/export/" + f + "?profileId=" + profile}>
-                تنزيل {f.toUpperCase()}
-              </a>
-            ))}
+            </select>
+          </label>
+          <span aria-hidden="true">·</span>
+          <span className="tabular-nums whitespace-nowrap">
+            {questions.length} سؤال
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="tabular-nums whitespace-nowrap">
+            {assets.length} صورة
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="whitespace-nowrap">
+            {configured
+              ? `Gemini · ${health?.models?.text || "gemini-3.1-flash-lite"}`
+              : "مفتاح Gemini غير مضبوط"}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={() => setAssistantOpen(true)}
+            className="inline-flex items-center gap-2 rounded-md bg-emerald-900 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-800 whitespace-nowrap shrink-0"
+          >
+            <Bot className="w-4 h-4" />
+            المساعد الذكي
+          </button>
+        </div>
+      </header>
+
+      <div className="flex-1 flex relative">
+        {mobileNavOpen && (
+          <div
+            aria-hidden="true"
+            onClick={() => setMobileNavOpen(false)}
+            className="fixed inset-0 top-16 z-30 bg-slate-900/30 lg:hidden"
+          />
+        )}
+        {/* RTL Sidebar Navigation */}
+        <aside
+          className={`${
+            mobileNavOpen
+              ? "fixed top-16 bottom-0 right-0 z-40 block overflow-y-auto shadow-lg"
+              : "hidden"
+          } lg:block lg:sticky lg:top-16 lg:h-[calc(100vh-4rem)] lg:overflow-y-auto w-60 shrink-0 bg-white border-l border-slate-200 p-4 space-y-6`}
+        >
+          <div className="md:hidden pb-3 border-b border-slate-100">
+            <label className="block text-xs font-medium text-slate-700">
+              اللعبة
+              <select
+                value={profileId}
+                onChange={(e) => setProfileId(e.target.value)}
+                className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
+              >
+                {profiles.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
-          {questions.map((q) => (
-            <article key={q.id}>
-              <strong>{q.question}</strong>
-              <p>
-                {q.answer} · {labels[q.difficulty]}
-              </p>
-              {q.image && (
-                <img src={"/api/assets/" + q.image} alt="صورة السؤال" />
-              )}
-              <label>
-                صورة السؤال
-                <select
-                  value={q.image || ""}
-                  disabled={busy}
-                  onChange={(e) => {
-                    const assetId = e.target.value || null;
-                    void act(async () => {
-                      await api("questions/" + q.id + "/image", {
-                        profileId: profile,
-                        assetId,
-                      });
-                      Q(await api("questions?profileId=" + profile));
-                    });
+
+          <nav aria-label="أقسام المنصة" className="space-y-1">
+            {NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const active = tab === item.key;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => {
+                    setTab(item.key);
+                    setMsg("");
+                    setMobileNavOpen(false);
+                    window.scrollTo({ top: 0 });
                   }}
+                  className={`w-full flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition-colors whitespace-nowrap ${
+                    active
+                      ? "bg-emerald-900 text-white"
+                      : "text-slate-700 hover:bg-slate-100 hover:text-slate-900"
+                  }`}
                 >
-                  <option value="">بدون صورة</option>
-                  {assets.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.origin} · {a.id.slice(0, 6)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <details>
-                <summary>دليل الإجابة</summary>
-                <p>{q.quote}</p>
-                <a href={q.source} target="_blank" rel="noreferrer">
-                  المصدر
-                </a>
-              </details>
-            </article>
-          ))}
-        </section>
-      )}
-      {tab === "الوسائط" && (
-        <>
-          <section>
-            <h2>إضافة صورة أو إطار فيديو</h2>
-            <input
-              aria-label="ملف الوسائط"
-              type="file"
-              accept="image/*,video/*"
-              onChange={(e) => F(e.target.files?.[0])}
-            />
-            {file?.type.startsWith("video/") && (
-              <label>
-                الثانية
-                <input
-                  type="number"
-                  min="0"
-                  step=".1"
-                  value={time}
-                  onChange={(e) => D(Number(e.target.value))}
-                />
-              </label>
-            )}
-            <label>
-              صاحب الصورة أو المقطع
-              <input value={credit} onChange={(e) => G(e.target.value)} />
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={rights}
-                onChange={(e) => H(e.target.checked)}
-              />{" "}
-              لدي إذن الاستخدام
-            </label>
-            {button(
-              "حفظ في المكتبة",
-              async () => {
-                if (!file) return;
-                const video = file.type.startsWith("video/");
-                const a = await api("assets", {
-                  data: await base64(video ? await frame(file, time) : file),
-                  rights,
-                  credit,
-                  origin: video ? file.name + " @ " + time + "s" : file.name,
-                });
-                I(a.id);
-                A(await api("assets"));
-                M("حُفظت الصورة");
-              },
-              !file || !rights || !credit,
-            )}
-          </section>
-          <section>
-            <h2>معالجة الصور</h2>
-            <label>
-              الصورة الأصلية
-              <select value={asset} onChange={(e) => I(e.target.value)}>
-                <option value="">توليد صورة جديدة</option>
-                {assets.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.origin} · {a.id.slice(0, 6)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {asset && <img src={"/api/assets/" + asset} alt="الصورة المحددة" />}
-            <label>
-              التأثير المحلي
-              <select value={style} onChange={(e) => L(e.target.value)}>
-                {Object.entries({
-                  sketch: "رسم بالقلم",
-                  bw: "أبيض وأسود",
-                  silhouette: "ظل",
-                  cartoon: "كرتون",
-                }).map(([v, n]) => (
-                  <option key={v} value={v}>
-                    {n}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {button(
-              "تطبيق التأثير",
-              async () => {
-                const a = await api("assets/transform", {
-                  assetId: asset,
-                  style,
-                });
-                A(await api("assets"));
-                I(a.id);
-              },
-              !asset,
-            )}
-            <label>
-              وصف التوليد أو التعديل
-              <textarea value={prompt} onChange={(e) => O(e.target.value)} />
-            </label>
-            {button(
-              "تنفيذ باستخدام Gemini",
-              async () => {
-                const a = await api("assets/generate", {
-                  prompt,
-                  assetId: asset || undefined,
-                });
-                A(await api("assets"));
-                I(a.id);
-              },
-              !prompt,
-            )}
-          </section>
-        </>
-      )}
-      {tab === "بحث" && (
-        <section>
-          <h2>بحث المصادر والصور</h2>
-          <label>
-            عبارة البحث
-            <input value={query} onChange={(e) => V(e.target.value)} />
-          </label>
-          {["facts", "images"].map((k) => (
-            <React.Fragment key={k}>
-              {button(
-                k === "facts" ? "معلومات" : "صور حقيقية",
-                async () => {
-                  const rs = await api(
-                    "search?kind=" + k + "&q=" + encodeURIComponent(query),
-                  );
-                  X(rs);
-                  if (!rs.length) M("لم تظهر نتائج");
-                },
-                !query,
-              )}
-            </React.Fragment>
-          ))}
-          {hits.map((h) => (
-            <article key={h.url}>
-              <a href={h.origin || h.url} target="_blank" rel="noreferrer">
-                {h.title}
-              </a>
-              {h.origin ? (
-                <img src={h.url} alt={h.title} />
-              ) : (
-                <p>{h.text?.slice(0, 300)}</p>
-              )}
-            </article>
-          ))}
-        </section>
-      )}
-      {tab === "ملفات الألعاب" && (
-        <section>
-          <h2>ملف لعبة جديد</h2>
-          <label>
-            اسم اللعبة
-            <input value={name} onChange={(e) => N(e.target.value)} />
-          </label>
-          <label>
-            قواعد صياغة الأسئلة
-            <textarea value={rules} onChange={(e) => U(e.target.value)} />
-          </label>
-          <label>
-            استنتاج حقول نموذج JSON أو CSV أو Excel
-            <input
-              type="file"
-              accept=".json,.csv,.xlsx"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f)
-                  void act(async () => {
-                    const t = await api("templates/infer", {
-                      format: f.name.split(".").pop()?.toLowerCase(),
-                      data: await base64(f),
-                    });
-                    Y(t.mapping);
-                    K(t.columns.map((c: { name: string }) => c.name));
-                    M("عدد سجلات النموذج " + t.rows);
-                  });
-              }}
-            />
-          </label>
-          {fields.map((k) => (
-            <label key={k}>
-              {
-                {
-                  question: "السؤال",
-                  answer: "الإجابة",
-                  image: "مسار الصورة",
-                  difficulty: "الصعوبة",
-                  source: "المصدر",
-                }[k]
-              }
-              <input
-                list="columns"
-                value={mapping[k] ?? k}
-                onChange={(e) => Y({ ...mapping, [k]: e.target.value })}
-              />
-            </label>
-          ))}
-          <datalist id="columns">
-            {columns.map((c) => (
-              <option key={c} value={c} />
-            ))}
-          </datalist>
-          {button(
-            "إنشاء ملف اللعبة",
-            async () => {
-              const p = await api("profiles", { name, rules, mapping });
-              Ps(await api("profiles"));
-              P(p.id);
-              N("");
-              T("الإنتاج");
-            },
-            !name.trim(),
+                  <Icon className="w-4 h-4 shrink-0" />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+
+          {activeProfile && (
+            <div className="border-t border-slate-100 pt-4 space-y-1.5 text-xs text-slate-500">
+              <p className="font-semibold text-slate-800 truncate">
+                {activeProfile.name}
+              </p>
+              <p className="line-clamp-3 leading-relaxed">
+                {activeProfile.rules || "بدون قواعد مخصصة بعد."}
+              </p>
+            </div>
           )}
-        </section>
-      )}
-    </main>
+        </aside>
+
+        {/* Main Studio Viewport */}
+        <main className="flex-1 min-w-0 p-4 lg:p-8 max-w-7xl mx-auto w-full space-y-5">
+          {msg && (
+            <p
+              role="status"
+              className="rounded-md border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900"
+            >
+              {msg}
+            </p>
+          )}
+
+          {tab === "production" && (
+            <ProductionStudio
+              profileId={profileId}
+              jobs={jobs}
+              busy={busy}
+              configured={configured}
+              onInterpret={(request) =>
+                act(() => api<Plan>("interpret", { request }))
+              }
+              onStartJob={(plan) =>
+                act(async () => {
+                  const j = await api<Job>("jobs", { profileId, plan });
+                  setJobs((s) => [...s.filter((v) => v.id !== j.id), j]);
+                  setMsg("أُضيفت المهمة إلى قائمة الإنتاج");
+                })
+              }
+              onPauseJob={(jobId) =>
+                act(async () => {
+                  await api("jobs/" + jobId + "/pause", {});
+                  await refreshNow();
+                  setMsg("تم إيقاف المهمة مؤقتًا");
+                })
+              }
+              onResumeJob={(jobId) =>
+                act(async () => {
+                  await api("jobs/" + jobId + "/retry", {});
+                  await refreshNow();
+                  setMsg("أُعيدت جدولة المهمة");
+                })
+              }
+            />
+          )}
+
+          {tab === "library" && (
+            <QuestionLibrary
+              profileId={profileId}
+              questions={questions}
+              assets={assets}
+              busy={busy}
+              onCreateQuestion={(input) =>
+                act(async () => {
+                  await api("questions", { profileId, ...input });
+                  await refreshNow();
+                  setMsg("أُضيف السؤال إلى المكتبة");
+                })
+              }
+              onUpdateQuestion={(id, patch) =>
+                act(async () => {
+                  await api("questions/" + id, { profileId, ...patch }, "PATCH");
+                  await refreshNow();
+                  setMsg("تم حفظ التعديلات");
+                })
+              }
+              onDeleteQuestion={(id) =>
+                act(async () => {
+                  await api(
+                    "questions/" + id + "?profileId=" + profileId,
+                    undefined,
+                    "DELETE",
+                  );
+                  await refreshNow();
+                  setMsg("حُذف السؤال");
+                })
+              }
+              onBulkAction={(ids, action, difficulty) =>
+                act(async () => {
+                  await api("questions/bulk", {
+                    profileId,
+                    ids,
+                    action,
+                    difficulty,
+                  });
+                  await refreshNow();
+                  setMsg("تم تنفيذ الإجراء الجماعي");
+                })
+              }
+            />
+          )}
+
+          {tab === "media" && (
+            <MediaLab
+              assets={assets}
+              selectedAssetId={selectedAssetId}
+              onSelectAsset={setSelectedAssetId}
+              busy={busy}
+              onUploadAsset={(payload) =>
+                act(async () => {
+                  const a = await api<Asset>("assets", payload);
+                  setSelectedAssetId(a.id);
+                  await refreshNow();
+                  setMsg("حُفظت الصورة في المكتبة");
+                })
+              }
+              onTransformAsset={(payload) =>
+                act(async () => {
+                  const a = await api<Asset>("assets/transform", payload);
+                  setSelectedAssetId(a.id);
+                  await refreshNow();
+                  setMsg("تم تطبيق التأثير وحفظ نسخة جديدة");
+                })
+              }
+              onGenerateAsset={(payload) =>
+                act(async () => {
+                  const a = await api<Asset>("assets/generate", payload);
+                  setSelectedAssetId(a.id);
+                  await refreshNow();
+                  setMsg("تم تنفيذ التوليد وحفظ الصورة");
+                })
+              }
+            />
+          )}
+
+          {tab === "search" && (
+            <ResearchHub
+              busy={busy}
+              onSearchFacts={(q, source) =>
+                act(async () => {
+                  const res = await api(
+                    "search?kind=facts&source=" +
+                      source +
+                      "&q=" +
+                      encodeURIComponent(q),
+                  );
+                  if (!res.length) setMsg("لم تظهر نتائج معلومات");
+                  return res;
+                })
+              }
+              onSearchImages={(q, source) =>
+                act(async () => {
+                  const res = await api(
+                    "search?kind=images&source=" +
+                      source +
+                      "&q=" +
+                      encodeURIComponent(q),
+                  );
+                  if (!res.length) setMsg("لم تظهر نتائج صور");
+                  return res;
+                })
+              }
+              onImportImageHit={(hit) =>
+                act(async () => {
+                  const a = await api<Asset>("assets/import-url", {
+                    url: hit.url,
+                    fallbackUrl: hit.fallbackUrl,
+                    origin: hit.origin,
+                    credit: hit.credit,
+                    license: hit.license,
+                  });
+                  setSelectedAssetId(a.id);
+                  await refreshNow();
+                  setMsg("استُوردت الصورة إلى المكتبة بنجاح");
+                })
+              }
+            />
+          )}
+
+          {tab === "audit" && (
+            <AuditCenter
+              profileId={profileId}
+              health={health}
+              busy={busy}
+              onRunAudit={(opts) =>
+                act(async () => {
+                  const report = await api("questions/audit", {
+                    profileId,
+                    ...opts,
+                  });
+                  await refreshNow();
+                  return report;
+                })
+              }
+              onReindex={() =>
+                act(async () => {
+                  const res = await api<{ reindexed: number }>(
+                    "questions/reindex",
+                    { profileId },
+                  );
+                  await refreshNow();
+                  setMsg(`أُعيدت فهرسة ${res.reindexed} سؤال`);
+                  return res.reindexed;
+                })
+              }
+              onDeleteQuestion={(id) =>
+                act(async () => {
+                  await api(
+                    "questions/" + id + "?profileId=" + profileId,
+                    undefined,
+                    "DELETE",
+                  );
+                  await refreshNow();
+                })
+              }
+            />
+          )}
+
+          {tab === "profiles" && (
+            <ProfilesAndExport
+              activeProfileId={profileId}
+              profiles={profiles}
+              busy={busy}
+              onInferTemplate={(payload) =>
+                act(async () => {
+                  const t = await api("templates/infer", payload);
+                  setMsg("عدد سجلات النموذج المستنتجة: " + t.rows);
+                  return t;
+                })
+              }
+              onCreateProfile={(p) =>
+                act(async () => {
+                  const created = await api<Profile & { id: string }>(
+                    "profiles",
+                    p,
+                  );
+                  setProfileId(created.id);
+                  await refreshNow(created.id);
+                  setTab("production");
+                  setMsg("تم إنشاء ملف اللعبة والتبديل إليه");
+                })
+              }
+              onUpdateProfile={(id, p) =>
+                act(async () => {
+                  await api("profiles/" + id, p, "PATCH");
+                  await refreshNow();
+                  setMsg("تم حفظ إعدادات الملف");
+                })
+              }
+              onDeleteProfile={(id) =>
+                act(async () => {
+                  await api("profiles/" + id, undefined, "DELETE");
+                  setProfileId("default");
+                  await refreshNow("default");
+                  setMsg("تم حذف ملف اللعبة");
+                })
+              }
+              onFetchExportPreview={(pid) =>
+                api<ExportPreview>("export/json/preview?profileId=" + pid)
+              }
+            />
+          )}
+        </main>
+      </div>
+
+      <AssistantDrawer
+        open={assistantOpen}
+        onClose={() => setAssistantOpen(false)}
+        messages={assistantMessages}
+        busy={busy}
+        configured={configured}
+        onSend={(message) =>
+          act(async () => {
+            const res = await api<CopilotTurnResponse>("assistant/chat", {
+              profileId,
+              message,
+            });
+            const nextPid = res.hints.selectProfileId || profileId;
+            if (res.hints.selectProfileId) setProfileId(res.hints.selectProfileId);
+            if (res.hints.selectAssetId) setSelectedAssetId(res.hints.selectAssetId);
+            if (res.hints.switchTab) setTab(res.hints.switchTab as TabKey);
+            await refreshNow(nextPid);
+          })
+        }
+        onClear={() =>
+          act(async () => {
+            await api(
+              "assistant/history?profileId=" + profileId,
+              undefined,
+              "DELETE",
+            );
+            await refreshNow();
+          })
+        }
+      />
+    </div>
   );
 }
+
 createRoot(document.getElementById("root")!).render(<Studio />);

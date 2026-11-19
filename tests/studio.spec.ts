@@ -1,11 +1,13 @@
 import { test, expect } from "@playwright/test";
-test("Arabic UI imports a profile, uploads and processes an image, exports the library", async ({
+
+test("Arabic Studio imports profile, creates/edits question, processes media, audits, and exports ZIP", async ({
   page,
 }) => {
   await page.goto("/");
   await expect(
     page.getByRole("heading", { name: "GameForge AI" }),
   ).toBeVisible();
+
   await page.getByRole("button", { name: "ملفات الألعاب" }).click();
   await page
     .locator("input[type=file]")
@@ -20,6 +22,7 @@ test("Arabic UI imports a profile, uploads and processes an image, exports the l
   await expect(
     page.getByRole("heading", { name: "خطة الأسئلة" }),
   ).toBeVisible();
+
   await page.getByRole("button", { name: "الوسائط", exact: true }).click();
   const data = await page.evaluate(() => {
     const c = document.createElement("canvas");
@@ -33,7 +36,7 @@ test("Arabic UI imports a profile, uploads and processes an image, exports the l
       mimeType: "image/png",
       buffer: Buffer.from(data, "base64"),
     });
-  await page.getByLabel("صاحب الصورة").fill("اختبار");
+  await page.getByLabel("صاحب الصورة أو المقطع").fill("اختبار");
   await page.getByRole("checkbox").check();
   await page.getByRole("button", { name: "حفظ في المكتبة" }).click();
   await expect(page.getByRole("status")).toContainText("حُفظت");
@@ -41,11 +44,31 @@ test("Arabic UI imports a profile, uploads and processes an image, exports the l
     old = await img.getAttribute("src");
   await page.getByRole("button", { name: "تطبيق التأثير" }).click();
   await expect(img).not.toHaveAttribute("src", old!);
+
+  await page.getByRole("button", { name: "المكتبة", exact: true }).click();
+  await page.getByRole("button", { name: "إضافة سؤال يدويًا" }).click();
+  await page.getByLabel("نص السؤال").fill("ما هي عاصمة الأردن؟");
+  await page.getByLabel("الإجابة المعتمدة").fill("عمّان");
+  await page
+    .getByLabel("الاقتباس الداعم")
+    .fill("عمّان عاصمة المملكة الأردنية الهاشمية");
+  await page.getByRole("button", { name: "حفظ التغييرات" }).click();
+  await expect(page.getByText("ما هي عاصمة الأردن؟")).toBeVisible();
+
+  await page.getByRole("button", { name: "التدقيق", exact: true }).click();
+  await page.getByLabel("التحقق من صحة الإجابات عبر Google Search").uncheck();
+  await page
+    .getByLabel("فحص تطابق الصور وكشف النصوص عبر Gemini Vision")
+    .uncheck();
+  await page.getByRole("button", { name: "تشغيل التدقيق الشامل" }).click();
+  await expect(page.getByText("تقرير التدقيق")).toBeVisible();
+
   await page.getByRole("button", { name: "المكتبة", exact: true }).click();
   const download = page.waitForEvent("download");
   await page.getByRole("link", { name: "تنزيل ZIP" }).click();
   expect((await download).suggestedFilename()).toBe("questions.zip");
 });
+
 test("authorized video frame becomes a PNG", async ({ page }) => {
   await page.goto("/");
   const bytes = await page.evaluate(async () => {
@@ -77,7 +100,7 @@ test("authorized video frame becomes a PNG", async ({ page }) => {
       buffer: Buffer.from(bytes),
     });
   await page.getByLabel("الثانية").fill("0.1");
-  await page.getByLabel("صاحب الصورة").fill("اختبار");
+  await page.getByLabel("صاحب الصورة أو المقطع").fill("اختبار");
   await page.getByRole("checkbox").check();
   await page.getByRole("button", { name: "حفظ في المكتبة" }).click();
   await expect(page.getByRole("status")).toContainText("حُفظت", {

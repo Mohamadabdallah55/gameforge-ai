@@ -1,7 +1,16 @@
 import { defineConfig } from "@playwright/test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+
+const fallbackExecutable =
+  "/ms-playwright/chrome-headless-shell-linux64/chrome-headless-shell";
+const executablePath =
+  process.env.PLAYWRIGHT_EXECUTABLE_PATH ||
+  (!process.env.CHROME_CHANNEL && existsSync(fallbackExecutable)
+    ? fallbackExecutable
+    : undefined);
+
 export default defineConfig({
   testDir: "tests",
   testMatch: "*.spec.ts",
@@ -9,6 +18,7 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:3417",
     channel: process.env.CHROME_CHANNEL || undefined,
+    launchOptions: executablePath ? { executablePath } : undefined,
   },
   webServer: {
     command: "npm start",

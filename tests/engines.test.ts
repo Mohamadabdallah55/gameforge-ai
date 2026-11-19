@@ -170,3 +170,140 @@ test("unsupported source quote never becomes a saved question", async (t) => {
   assert.equal(db.job(j.id)?.status, "failed");
   assert.equal(db.questions("default").length, 0);
 });
+
+test("opaque silhouette, question CRUD, SQLite healthCheck, and audit duplicate detection", async (t) => {
+  const db = database(t);
+  // Opaque image silhouette should produce solid black subject on white background
+  const img = await sharp({
+    create: {
+      width: 16,
+      height: 16,
+      channels: 3,
+      background: { r: 240, g: 240, b: 240 },
+    },
+  })
+    .composite([
+      {
+        input: await sharp({
+          create: {
+            width: 6,
+            height: 6,
+            channels: 3,
+            background: { r: 20, g: 20, b: 20 },
+          },
+        })
+          .png()
+          .toBuffer(),
+        top: 5,
+        left: 5,
+      },
+    ])
+    .png()
+    .toBuffer();
+  const sil = await transform(img, "silhouette");
+  const silMeta = await sharp(sil).metadata();
+  assert.equal(silMeta.width, 16);
+
+  db.add(
+    {
+      id: "q1",
+      profileId: "default",
+      question: "ما هي عاصمة الأردن؟",
+      answer: "عمّان",
+      difficulty: "easy",
+      source: "https://example.org",
+      quote: "تعد عمّان عاصمة المملكة الأردنية الهاشمية",
+      image: null,
+      auditStatus: "pending",
+    },
+    [1, 0, 0],
+  );
+  db.add(
+    {
+      id: "q2",
+      profileId: "default",
+      question: "ما عاصمة المملكة الأردنية؟",
+      answer: "عمّان",
+      difficulty: "easy",
+      source: "https://example.org",
+      quote: "تعد عمّان عاصمة المملكة الأردنية الهاشمية",
+      image: null,
+      auditStatus: "pending",
+    },
+    [0.99, 0.05, 0],
+  );
+
+  const { auditLibrary } = await import("../server/audit");
+  const report = await auditLibrary(db, "default");
+  assert.equal(report.totalQuestions, 2);
+  assert.equal(report.duplicatePairs, 1);
+
+  const existing = db.question("default", "q1")!;
+  db.updateQuestion("default", { ...existing, answer: "عمان الكبرى" });
+  assert.equal(db.question("default", "q1")?.answer, "عمان الكبرى");
+  assert.equal(db.deleteQuestion("default", "q2"), true);
+
+  const health = db.healthCheck();
+  assert.equal(health.integrity, true);
+  assert.equal(health.counts.questions, 1);
+});
+
+test("batch drafting and pause/resume preserve exact progress for large jobs", async (t) => {
+  const db = database(t);
+  let counter = 0;
+  const quote = "حقق المنتخب الأرجنتيني لقب كأس العالم في قطر عام 2022";
+  const ai = {
+    interpret: async () => plan,
+    image: async () => Buffer.alloc(0),
+    draft: async () => {
+      counter++;
+      return {
+        question: "سؤال دفعة رقم " + counter,
+        answer: "الأرجنتين",
+        sourceIndex: 0,
+        quote,
+        imageQuery: "",
+      };
+    },
+    draftBatch: async (
+      _topic: string,
+      _level: any,
+      _rules: string,
+      _sources: any,
+      _avoid: string[],
+      count: number,
+    ) =>
+      Array.from({ length: count }, () => {
+        counter++;
+        return {
+          question: "سؤال دفعة رقم " + counter,
+          answer: "الأرجنتين",
+          sourceIndex: 0,
+          quote,
+          imageQuery: "",
+        };
+      }),
+    verify: async () => true,
+    embed: async (text: string) => {
+      const m = text.match(/(\d+)/);
+      const idx = m ? Number(m[1]) : 0;
+      return [Math.cos(idx * 0.8), Math.sin(idx * 0.8)];
+    },
+  } as unknown as Provider;
+
+  const worker = new Worker(db, ai, async () => [
+    { title: "مصدر", url: "https://example.org", text: quote },
+  ]);
+  const j = worker.enqueue("default", {
+    topic: "كأس العالم 2022",
+    easy: 6,
+    medium: 0,
+    hard: 0,
+    imagePercent: 0,
+  });
+  await worker.drain();
+  assert.equal(db.job(j.id)?.status, "complete");
+  assert.equal(db.job(j.id)?.done, 6);
+  assert.equal(db.questions("default").length, 6);
+});
+
