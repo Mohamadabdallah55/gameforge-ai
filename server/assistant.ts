@@ -730,15 +730,19 @@ export async function runAssistantTurn(
 
   let finalReply = "";
   for (let step = 0; step < 6; step++) {
-    const res = await client.models.generateContent({
-      model: ai.textModel,
-      contents,
-      config: {
-        thinkingConfig: ai.fastThinkingConfig,
-        systemInstruction,
-        tools: [{ functionDeclarations: declarations }],
-      },
-    });
+    const res = await ai.runCall(() =>
+      client.models.generateContent({
+        model: ai.textModel,
+        contents,
+        config: {
+          ...(ai.fastThinkingConfig
+            ? { thinkingConfig: ai.fastThinkingConfig }
+            : {}),
+          systemInstruction,
+          tools: [{ functionDeclarations: declarations }],
+        },
+      }),
+    );
 
     const modelContent = res.candidates?.[0]?.content;
     const calls = res.functionCalls;

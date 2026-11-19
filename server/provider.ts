@@ -24,31 +24,52 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function extractErrorDetail(msg: string): string {
+  try {
+    const start = msg.indexOf("{");
+    if (start !== -1) {
+      const parsed = JSON.parse(msg.slice(start));
+      const inner = parsed?.error?.message || parsed?.message;
+      if (typeof inner === "string" && inner.trim()) {
+        return inner.trim().slice(0, 220);
+      }
+    }
+  } catch {
+    // ignore JSON parse failure
+  }
+  return msg.replace(/\s+/g, " ").trim().slice(0, 180);
+}
+
 function formatGeminiError(err: unknown): Error {
   const msg = err instanceof Error ? err.message : String(err);
-  if (/GEMINI_API_KEY/.test(msg)) return new Error(msg);
+  if (/MY_CUSTOM_GEMINI_KEY|GEMINI_API_KEY/.test(msg)) return new Error(msg);
+  const detail = extractErrorDetail(msg);
   if (/API_KEY_INVALID|API key not valid/i.test(msg)) {
     return new Error(
-      "مفتاح Gemini API غير صالح أو غير مفعّل. يرجى التحقق من GEMINI_API_KEY في إعدادات الأسرار.",
+      `مفتاح Gemini API غير صالح أو غير مفعّل. يرجى التحقق من MY_CUSTOM_GEMINI_KEY في إعدادات الأسرار. (${detail})`,
     );
   }
   if (/PERMISSION_DENIED|403/.test(msg)) {
-    return new Error(
-      "تم رفض الصلاحية من Gemini (403). تأكد من تفعيل الصلاحيات أو اختيار مفتاح مدفوع للنماذج المتقدمة.",
-    );
+    return new Error(`تم رفض الصلاحية من Gemini (403): ${detail}`);
   }
   if (/RESOURCE_EXHAUSTED|429/.test(msg)) {
     return new Error(
-      "تم بلوغ حد الحصة في Gemini (429). انتظر قليلاً ثم استأنف أو استخدم مفتاحًا مدفوعًا.",
+      `تم بلوغ حد الحصة في Gemini (429): ${detail}`,
     );
   }
   if (/NOT_FOUND|404/.test(msg)) {
-    return new Error("النموذج المطلوب غير متاح حاليًا.");
+    return new Error(`النموذج المطلوب غير متاح حاليًا (404): ${detail}`);
   }
-  return new Error("تعذر إتمام طلب Gemini: " + msg.slice(0, 180));
+  return new Error("تعذر إتمام طلب Gemini: " + detail);
 }
 
-async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+export const DEFAULT_GEMINI_DELAY_MS = 3000;
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  attempts = 3,
+  minRetryDelayMs = DEFAULT_GEMINI_DELAY_MS,
+): Promise<T> {
   let last: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -61,29 +82,21 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
           msg,
         );
       if (!retryable || i === attempts - 1) break;
-      await sleep(1000 * 2 ** i + Math.round(Math.random() * 400));
+      const base = minRetryDelayMs > 0 ? minRetryDelayMs : 250;
+      await sleep(base * 2 ** i + Math.round(Math.random() * 400));
     }
   }
   throw formatGeminiError(last);
 }
 
 export function resolveGeminiKey(): string {
-  const raw =
-    process.env.GEMINI_API_KEY ||
-    process.env.GOOGLE_API_KEY ||
-    process.env.VERTEX_EXPRESS_API_KEY ||
-    "";
+  const raw = process.env.MY_CUSTOM_GEMINI_KEY || "";
   return raw.trim().replace(/^["']|["']$/g, "");
 }
 
 export function buildGoogleGenAIOptions(apiKey: string) {
-  const isExpress =
-    apiKey.startsWith("AQ.") ||
-    process.env.GOOGLE_GENAI_USE_ENTERPRISE === "true" ||
-    process.env.GOOGLE_GENAI_USE_VERTEXAI === "true";
   return {
     apiKey,
-    ...(isExpress ? { enterprise: true } : {}),
     httpOptions: {
       headers: {
         "User-Agent": "aistudio-build",
@@ -93,10 +106,38 @@ export function buildGoogleGenAIOptions(apiKey: string) {
 }
 
 export class Gemini implements Provider {
-  constructor(private customClient?: GoogleGenAI) {}
+  private readonly minDelayMs: number;
+  private paceChain: Promise<void> = Promise.resolve();
+  private lastRequestCompletedAt = 0;
+  private googleSearchCooldownUntil = 0;
+
+  constructor(
+    private customClient?: GoogleGenAI,
+    minDelayMs?: number,
+  ) {
+    if (typeof minDelayMs === "number") {
+      this.minDelayMs = Math.max(0, minDelayMs);
+    } else if (customClient) {
+      this.minDelayMs = 0;
+    } else {
+      const envDelay = Number(process.env.GEMINI_MIN_DELAY_MS);
+      this.minDelayMs =
+        Number.isFinite(envDelay) && envDelay >= 0
+          ? envDelay
+          : DEFAULT_GEMINI_DELAY_MS;
+    }
+  }
+
+  get defaultDelayMs() {
+    return this.minDelayMs;
+  }
+
+  isGoogleSearchThrottled() {
+    return Date.now() < this.googleSearchCooldownUntil;
+  }
 
   get textModel() {
-    const env = process.env.GEMINI_TEXT_MODEL;
+    const env = process.env.GEMINI_TEXT_MODEL?.trim();
     if (!env || env === "gemini-flash-latest") return "gemini-3.1-flash-lite";
     return env;
   }
@@ -125,21 +166,47 @@ export class Gemini implements Provider {
     return "gemini-3.1-flash-lite-image";
   }
 
+  async runCall<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+    const execute = async (): Promise<T> => {
+      if (this.minDelayMs > 0 && this.lastRequestCompletedAt > 0) {
+        const elapsed = Date.now() - this.lastRequestCompletedAt;
+        const waitMs = this.minDelayMs - elapsed;
+        if (waitMs > 0) {
+          await sleep(waitMs);
+        }
+      }
+      try {
+        return await withRetry(fn, attempts, this.minDelayMs);
+      } finally {
+        this.lastRequestCompletedAt = Date.now();
+      }
+    };
+
+    const run = this.paceChain.then(execute, execute);
+    this.paceChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   client(): GoogleGenAI {
     if (this.customClient) return this.customClient;
     const key = resolveGeminiKey();
-    if (!key) throw new Error("أضف GEMINI_API_KEY إلى بيئة الخادم");
+    if (!key) throw new Error("أضف MY_CUSTOM_GEMINI_KEY إلى بيئة الخادم");
     return new GoogleGenAI(buildGoogleGenAIOptions(key));
   }
 
   async interpret(request: string) {
     const ai = this.client();
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.generateContent({
         model: this.textModel,
         contents: request,
         config: {
-          thinkingConfig: this.fastThinkingConfig,
+          ...(this.fastThinkingConfig
+            ? { thinkingConfig: this.fastThinkingConfig }
+            : {}),
           systemInstruction:
             "استخرج الموضوع مع الموسم أو السنة بدقة من طلب المستخدم العربي. أعد JSON فقط بالصيغة المطلوبة. احترم الأعداد والأرقام العربية والنسب المئوية. وزع الإجمالي بالتساوي إن لم تحدد الصعوبة، والافتراضي سؤال واحد لكل مستوى وبدون صور.",
           responseMimeType: "application/json",
@@ -168,12 +235,14 @@ export class Gemini implements Provider {
     avoid: string[],
   ): Promise<Candidate> {
     const ai = this.client();
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.generateContent({
         model: this.textModel,
         contents: JSON.stringify({ topic, level, rules, sources, avoid }),
         config: {
-          thinkingConfig: this.fastThinkingConfig,
+          ...(this.fastThinkingConfig
+            ? { thinkingConfig: this.fastThinkingConfig }
+            : {}),
           systemInstruction:
             "اكتب سؤال مسابقة عربيًا احترافيًا بإجابة واحدة قاطعة ضمن الموضوع والنطاق الزمني ومستوى الصعوبة والقواعد المحددة، بالاعتماد على الأدلة المرفقة فقط. تجنب تكرار الأسئلة السابقة أو صياغاتها. يجب أن يكون quote اقتباسًا حرفيًا من نص المصدر المشار إليه في sourceIndex (يبدأ من 0) ويدعم الجواب مباشرة. imageQuery عبارة بحث إنجليزية قصيرة ودقيقة عن الصورة المناسبة للسؤال.",
           responseMimeType: "application/json",
@@ -204,7 +273,7 @@ export class Gemini implements Provider {
   ): Promise<Candidate[]> {
     const ai = this.client();
     const batchSize = Math.max(1, Math.min(8, count));
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.generateContent({
         model: this.textModel,
         contents: JSON.stringify({
@@ -216,7 +285,9 @@ export class Gemini implements Provider {
           avoid,
         }),
         config: {
-          thinkingConfig: this.fastThinkingConfig,
+          ...(this.fastThinkingConfig
+            ? { thinkingConfig: this.fastThinkingConfig }
+            : {}),
           systemInstruction: `اكتب ${batchSize} أسئلة مسابقات عربية مختلفة تمامًا عن بعضها وعن قائمة avoid، لكل سؤال إجابة واحدة قاطعة ومستوى صعوبة (${level}) ضمن الموضوع والقواعد، ومستندة حرفيًا إلى الأدلة المرفقة. يجب أن يكون quote اقتباسًا حرفيًا موجودًا نصًا داخل sources[sourceIndex].text. imageQuery عبارة بحث إنجليزية قصيرة ودقيقة للصورة المناسبة.`,
           responseMimeType: "application/json",
           responseSchema: {
@@ -247,12 +318,14 @@ export class Gemini implements Provider {
 
   async verify(topic: string, draft: Candidate, source: Evidence) {
     const ai = this.client();
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.generateContent({
         model: this.textModel,
         contents: JSON.stringify({ topic, draft, source }),
         config: {
-          thinkingConfig: this.fastThinkingConfig,
+          ...(this.fastThinkingConfig
+            ? { thinkingConfig: this.fastThinkingConfig }
+            : {}),
           systemInstruction:
             "Verify that this Arabic trivia question strictly fits the specified topic, year, and season, has a single unambiguous answer, and is directly supported by the supplied passage. Reject ambiguous, multi-answer, or unsupported claims.",
           responseMimeType: "application/json",
@@ -278,7 +351,7 @@ export class Gemini implements Provider {
     quote: string,
   ): Promise<{ supported: boolean; note: string; sources: string[] }> {
     const ai = this.client();
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.generateContent({
         model: this.textModel,
         contents: `تحقق بدقة باستخدام البحث على Google من صحة سؤال المسابقة التالي وإجابته:
@@ -289,7 +362,9 @@ export class Gemini implements Provider {
 
 أجب أولاً بكلمة [صحيح] إذا كانت الإجابة دقيقة ومؤكدة ولا تحتمل اللبس، أو [ملاحظة] إذا كان هناك خطأ أو غموض أو إجابات متعددة، ثم اشرح السبب بإيجاز في سطر واحد بالعربية.`,
         config: {
-          thinkingConfig: this.fastThinkingConfig,
+          ...(this.fastThinkingConfig
+            ? { thinkingConfig: this.fastThinkingConfig }
+            : {}),
           tools: [{ googleSearch: {} }],
         },
       }),
@@ -310,17 +385,30 @@ export class Gemini implements Provider {
 
   async searchEvidence(term: string): Promise<Evidence[]> {
     const ai = this.client();
-    const res = await withRetry(() =>
-      ai.models.generateContent({
-        model: this.textModel,
-        contents: `ابحث عبر Google عن حقائق موثوقة ومفصلة باللغة العربية حول: "${term}".
+    let res;
+    try {
+      res = await this.runCall(
+        () =>
+          ai.models.generateContent({
+            model: this.textModel,
+            contents: `ابحث عبر Google عن حقائق موثوقة ومفصلة باللغة العربية حول: "${term}".
 اكتب 4 إلى 6 فقرات معلوماتية غنية بالحقائق الدقيقة (الأسماء الكاملة، التواريخ، الأرقام، النتائج، الملاعب، الألقاب، الأحداث المؤكدة) المناسبة لصياغة أسئلة مسابقات دقيقة، مع الالتزام بالمصادر الموثوقة.`,
-        config: {
-          thinkingConfig: this.fastThinkingConfig,
-          tools: [{ googleSearch: {} }],
-        },
-      }),
-    );
+            config: {
+              ...(this.fastThinkingConfig
+                ? { thinkingConfig: this.fastThinkingConfig }
+                : {}),
+              tools: [{ googleSearch: {} }],
+            },
+          }),
+        1,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/429|403|Quota|RESOURCE_EXHAUSTED|PERMISSION_DENIED/i.test(msg)) {
+        this.googleSearchCooldownUntil = Date.now() + 60_000;
+      }
+      throw err;
+    }
 
     const text = (res.text ?? "").trim();
     const meta = res.candidates?.[0]?.groundingMetadata;
@@ -371,12 +459,14 @@ export class Gemini implements Provider {
   async expandTopics(topic: string, totalQuestions: number): Promise<string[]> {
     const ai = this.client();
     const targetCount = Math.min(12, Math.max(2, Math.ceil(totalQuestions / 12)));
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.generateContent({
         model: this.textModel,
         contents: `الموضوع الرئيسي: "${topic}". أريد تقسيمه إلى ${targetCount} محاور بحث فرعية متخصصة ومتنوعة لتغطية ${totalQuestions} سؤال مسابقة دون تكرار.`,
         config: {
-          thinkingConfig: this.fastThinkingConfig,
+          ...(this.fastThinkingConfig
+            ? { thinkingConfig: this.fastThinkingConfig }
+            : {}),
           systemInstruction:
             "أعد مصفوفة JSON من عبارات البحث العربية الدقيقة والمحددة زمنيًا وموضوعيًا لاستكشاف جوانب مختلفة من الموضوع الرئيسي.",
           responseMimeType: "application/json",
@@ -393,7 +483,7 @@ export class Gemini implements Provider {
 
   async embed(text: string): Promise<number[]> {
     const ai = this.client();
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.embedContent({
         model: this.embedModel,
         contents: text,
@@ -451,7 +541,7 @@ export class Gemini implements Provider {
       ];
     }
 
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.generateContent({
         model,
         contents: { parts },
@@ -494,7 +584,7 @@ export class Gemini implements Provider {
     imageBuffer: Buffer,
   ): Promise<{ relevant: boolean; hasSpoiler: boolean; note: string }> {
     const ai = this.client();
-    const res = await withRetry(() =>
+    const res = await this.runCall(() =>
       ai.models.generateContent({
         model: this.textModel,
         contents: {
@@ -516,7 +606,9 @@ export class Gemini implements Provider {
           ],
         },
         config: {
-          thinkingConfig: this.fastThinkingConfig,
+          ...(this.fastThinkingConfig
+            ? { thinkingConfig: this.fastThinkingConfig }
+            : {}),
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,

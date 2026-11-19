@@ -64,7 +64,9 @@ test("Gemini SDK adapter validates JSON, Search Grounding, embeddings, and image
 
   const gemini = new Gemini(fakeClient);
   assert.equal(gemini.textModel, "gemini-3.1-flash-lite");
+  assert.equal(gemini.fastThinkingConfig?.thinkingLevel, "MINIMAL");
   assert.equal(gemini.embedModel, "gemini-embedding-2");
+  assert.equal(new Gemini().defaultDelayMs, 3000);
   assert.deepEqual(await gemini.interpret("ستة أسئلة عن الموسم الثاني"), plan);
   assert.deepEqual(await gemini.embed("نص"), [0, 1]);
   assert.deepEqual(
@@ -75,24 +77,37 @@ test("Gemini SDK adapter validates JSON, Search Grounding, embeddings, and image
   assert.equal(evidence.length, 1);
   assert.equal(evidence[0].url, "https://example.org/wc");
 
+  const pacedGemini = new Gemini(fakeClient, 60);
+  const timestamps: number[] = [];
+  await pacedGemini.runCall(async () => {
+    timestamps.push(Date.now());
+    return "first";
+  });
+  await pacedGemini.runCall(async () => {
+    timestamps.push(Date.now());
+    return "second";
+  });
+  assert.ok(
+    timestamps[1] - timestamps[0] >= 50,
+    `Expected consecutive paced calls to wait >= 50ms, got ${timestamps[1] - timestamps[0]}ms`,
+  );
+
   const standardOpts = buildGoogleGenAIOptions("AIzaFakeStandardKey");
+  assert.equal(standardOpts.apiKey, "AIzaFakeStandardKey");
   assert.equal((standardOpts as any).enterprise, undefined);
-  const expressOpts = buildGoogleGenAIOptions("AQ.FakeExpressKey");
-  assert.equal((expressOpts as any).enterprise, true);
+  const aqOpts = buildGoogleGenAIOptions("AQ.FakeKey");
+  assert.equal(aqOpts.apiKey, "AQ.FakeKey");
+  assert.equal((aqOpts as any).enterprise, undefined);
 });
 
 test("missing Gemini key reports an actionable error before network access", async (t) => {
-  const oldGemini = process.env.GEMINI_API_KEY;
-  const oldGoogle = process.env.GOOGLE_API_KEY;
-  const oldVertex = process.env.VERTEX_EXPRESS_API_KEY;
-  delete process.env.GEMINI_API_KEY;
-  delete process.env.GOOGLE_API_KEY;
-  delete process.env.VERTEX_EXPRESS_API_KEY;
+  const oldCustom = process.env.MY_CUSTOM_GEMINI_KEY;
+  delete process.env.MY_CUSTOM_GEMINI_KEY;
   t.after(() => {
-    if (oldGemini !== undefined) process.env.GEMINI_API_KEY = oldGemini;
-    if (oldGoogle !== undefined) process.env.GOOGLE_API_KEY = oldGoogle;
-    if (oldVertex !== undefined) process.env.VERTEX_EXPRESS_API_KEY = oldVertex;
+    if (oldCustom !== undefined) process.env.MY_CUSTOM_GEMINI_KEY = oldCustom;
   });
   assert.equal(resolveGeminiKey(), "");
-  await assert.rejects(new Gemini().interpret("طلب"), /GEMINI_API_KEY/);
+  await assert.rejects(new Gemini().interpret("طلب"), /MY_CUSTOM_GEMINI_KEY/);
+  process.env.MY_CUSTOM_GEMINI_KEY = ' "AQ.TestTrimmedKey" ';
+  assert.equal(resolveGeminiKey(), "AQ.TestTrimmedKey");
 });

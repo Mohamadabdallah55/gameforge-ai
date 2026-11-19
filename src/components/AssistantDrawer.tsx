@@ -161,7 +161,7 @@ export function AssistantDrawer({
           placeholder={
             configured
               ? "اكتب أمرك هنا... (مثال: أنشئ 20 سؤالاً عن الفضاء)"
-              : "أضف GEMINI_API_KEY لتفعيل المساعد"
+              : "أضف MY_CUSTOM_GEMINI_KEY لتفعيل المساعد"
           }
           className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-emerald-800 focus:outline-none disabled:bg-slate-50"
         />

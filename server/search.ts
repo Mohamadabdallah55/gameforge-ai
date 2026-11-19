@@ -1,4 +1,5 @@
 import type { Evidence, SearchSource } from "../shared/contracts";
+import { resolveGeminiKey } from "./provider";
 
 const USER_AGENT =
   process.env.WIKI_USER_AGENT ||
@@ -134,7 +135,10 @@ async function tavilyEvidence(term: string): Promise<Evidence[]> {
 export async function information(
   term: string,
   source: SearchSource = "auto",
-  ai?: { searchEvidence?: (q: string) => Promise<Evidence[]> },
+  ai?: {
+    searchEvidence?: (q: string) => Promise<Evidence[]>;
+    isGoogleSearchThrottled?: () => boolean;
+  },
 ): Promise<Evidence[]> {
   const merged: Evidence[] = [];
   const seen = new Set<string>();
@@ -168,7 +172,11 @@ export async function information(
       // fall through
     }
   }
-  if (process.env.GEMINI_API_KEY && ai?.searchEvidence) {
+  if (
+    resolveGeminiKey() &&
+    ai?.searchEvidence &&
+    !ai.isGoogleSearchThrottled?.()
+  ) {
     try {
       pushAll(await ai.searchEvidence(term));
     } catch {

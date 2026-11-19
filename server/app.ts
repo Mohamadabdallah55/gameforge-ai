@@ -66,7 +66,6 @@ export function createApp(db: Store, ai: Provider = new Gemini()) {
     r.json({
       ok: true,
       geminiConfigured: Boolean(key),
-      geminiMode: key.startsWith("AQ.") ? "vertex-express" : "gemini-api",
       models: {
         text: gemini?.textModel ?? "custom",
         embed: gemini?.embedModel ?? "custom",
