@@ -60,12 +60,12 @@ test("MY_CUSTOM_GEMINI_KEY supports AQ. keys and rejects deprecated models", () 
   process.env.GEMINI_API_KEY = "AIzaFallback";
   try {
     assert.equal(getGeminiApiKey(), "AQ.Ab8RN6SampleKeyValue");
-    assert.doesNotThrow(() => assertAllowedModel("gemini-4-hydrogen"));
-    assert.doesNotThrow(() => assertAllowedModel("gemini-3.1-flash-lite"));
-    assert.throws(() => assertAllowedModel("gemini-3.8-flash"), {
+    assert.doesNotThrow(() => assertAllowedModel("gemini-2.5-flash"));
+    assert.doesNotThrow(() => assertAllowedModel("gemini-2.5-flash-lite"));
+    assert.throws(() => assertAllowedModel("gemini-4-hydrogen"), {
       code: "gemini_model_not_allowed",
     });
-    assert.throws(() => assertAllowedModel("gemini-2.0-flash"), {
+    assert.throws(() => assertAllowedModel("gemini-3.8-flash"), {
       code: "gemini_model_not_allowed",
     });
   } finally {

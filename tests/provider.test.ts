@@ -15,7 +15,8 @@ test("Elite uses the configured official model, sends actual image input, and su
     GEMINI_API_KEY: "AQ.test-only-key",
     MY_CUSTOM_GEMINI_KEY: "",
     GEMINI_FREE_PROJECT_CONFIRMED: "0",
-    GEMINI_ELITE_MODEL: "gemini-4-hydrogen",
+    GEMINI_ELITE_MODEL: "gemini-2.5-flash",
+    GEMINI_DISABLE_FALLBACK: "1",
   };
   const saved = Object.keys(config).map(
     (key) => [key, process.env[key]] as const,
@@ -38,7 +39,7 @@ test("Elite uses the configured official model, sends actual image input, and su
       calls++;
       assert.match(
         url,
-        /\/models\/gemini-4-hydrogen/,
+        /\/models\/gemini-2.5-flash/,
       );
       assert.ok(!url.includes("AQ.test-only-key"));
       const hdrs = new Headers(
@@ -61,7 +62,7 @@ test("Elite uses the configured official model, sends actual image input, and su
             ? await target.text()
             : "{}";
       const body = JSON.parse(bodyText);
-      assert.equal(body.tools, undefined);
+      assert.deepEqual(body.tools, [{ googleSearch: {} }]);
       assert.equal(body.contents[0].parts[1].inlineData.mimeType, "image/png");
       return Response.json({ error: { code: 429, message: "quota exceeded" } }, { status: 429 });
     },

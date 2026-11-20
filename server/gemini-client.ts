@@ -3,8 +3,9 @@ import { z } from "zod";
 import { ProductionUnavailable } from "./production-state";
 
 export const FREE_TEXT_MODELS = [
-  "gemini-4-hydrogen",
-  "gemini-3.1-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
 ] as const;
 
 export const PAID_TEXT_MODELS = [
@@ -25,10 +26,11 @@ const DEPRECATED_OR_INVALID = new Set([
   "gemini-1.5-flash",
   "gemini-1.5-pro",
   "gemini-pro",
-  "gemini-2.0-flash",
   "gemini-2.0-pro",
   "gemini-2.0-flash-thinking",
   "gemini-3.8-flash",
+  "gemini-4-hydrogen",
+  "gemini-3.1-flash-lite",
   "gemini-3.5-flash-lite",
   "gemini-2.5-flash-image",
   "gemini-embedding-001",
@@ -36,15 +38,18 @@ const DEPRECATED_OR_INVALID = new Set([
 
 export function getGeminiApiKeyCandidates(): {
   key: string;
-  source: "MY_CUSTOM_GEMINI_KEY" | "GEMINI_API_KEY";
+  source: "MY_CUSTOM_GEMINI_KEY" | "GEMINI_API_KEY" | "API_KEY";
 }[] {
-  const out: { key: string; source: "MY_CUSTOM_GEMINI_KEY" | "GEMINI_API_KEY" }[] =
+  const out: { key: string; source: "MY_CUSTOM_GEMINI_KEY" | "GEMINI_API_KEY" | "API_KEY" }[] =
     [];
   const custom = process.env.MY_CUSTOM_GEMINI_KEY?.trim();
   const primary = process.env.GEMINI_API_KEY?.trim();
+  const fallback = process.env.API_KEY?.trim();
   if (custom) out.push({ key: custom, source: "MY_CUSTOM_GEMINI_KEY" });
   if (primary && primary !== custom)
     out.push({ key: primary, source: "GEMINI_API_KEY" });
+  if (fallback && fallback !== custom && fallback !== primary)
+    out.push({ key: fallback, source: "API_KEY" });
   return out;
 }
 
@@ -52,14 +57,14 @@ export function getGeminiApiKey(): string | undefined {
   return getGeminiApiKeyCandidates()[0]?.key;
 }
 
-export function getGeminiKeySource(): "MY_CUSTOM_GEMINI_KEY" | "GEMINI_API_KEY" | null {
+export function getGeminiKeySource(): "MY_CUSTOM_GEMINI_KEY" | "GEMINI_API_KEY" | "API_KEY" | null {
   return getGeminiApiKeyCandidates()[0]?.source ?? null;
 }
 
 export function resolveEliteModel(): string {
   const configured = process.env.GEMINI_ELITE_MODEL?.trim();
   if (!configured || DEPRECATED_OR_INVALID.has(configured)) {
-    return "gemini-4-hydrogen";
+    return "gemini-2.5-flash";
   }
   return configured;
 }
@@ -67,7 +72,7 @@ export function resolveEliteModel(): string {
 export function resolveFastModel(): string {
   const configured = process.env.GEMINI_FAST_MODEL?.trim();
   if (!configured || DEPRECATED_OR_INVALID.has(configured)) {
-    return "gemini-3.1-flash-lite";
+    return "gemini-2.5-flash-lite";
   }
   return configured;
 }
@@ -147,7 +152,7 @@ let lastCallTimestamp = 0;
 export function getMinDelayMs(): number {
   if (process.env.GEMINI_MIN_DELAY_MS !== undefined) {
     const parsed = Number(process.env.GEMINI_MIN_DELAY_MS);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2500;
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3000;
   }
   if (
     process.env.NODE_ENV === "test" ||
@@ -156,7 +161,7 @@ export function getMinDelayMs(): number {
   ) {
     return 0;
   }
-  return 2500;
+  return 3000;
 }
 
 export function resetGeminiPacerForTests() {
@@ -184,6 +189,7 @@ export async function runPacedGeminiCall<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export function mapGeminiError(error: unknown, fallbackModel?: string): ProductionUnavailable {
+  console.error("Gemini API Error Encountered:", error);
   if (error instanceof ProductionUnavailable) return error;
   const err = error as { status?: number; code?: number; message?: string };
   const status = err?.status || err?.code;
@@ -193,7 +199,7 @@ export function mapGeminiError(error: unknown, fallbackModel?: string): Producti
     /RESOURCE_EXHAUSTED|quota|rate.?limit|429/i.test(msg)
   ) {
     return new ProductionUnavailable(
-      "بلغ Gemini حد الحصة أو معدل الطلبات (429). حُفظ التقدم عند آخر سؤال مكتمل؛ انتظر دقيقة ثم استأنف أو راجع الحصة في Google AI Studio.",
+      "بلغ Gemini حد الحصة أو معدل الطلبات (429). التفاصيل: " + msg.slice(0, 200),
       "gemini_quota",
       429,
     );
@@ -204,34 +210,34 @@ export function mapGeminiError(error: unknown, fallbackModel?: string): Producti
     /PERMISSION_DENIED|API_KEY_INVALID|API key not valid|403|401/i.test(msg)
   ) {
     return new ProductionUnavailable(
-      "مفتاح Gemini مرفوض أو يفتقر لصلاحية الوصول (401/403). تحقق من Secrets في Google AI Studio.",
+      "مفتاح Gemini مرفوض أو يفتقر لصلاحية الوصول (401/403): " + msg.slice(0, 200),
       "gemini_access",
       status === 401 ? 401 : 403,
     );
   }
   if (status === 404 || /NOT_FOUND|not found|is not supported/i.test(msg)) {
     return new ProductionUnavailable(
-      `النموذج ${fallbackModel || "المحدد"} غير متاح في المشروع الحالي (404).`,
+      `النموذج ${fallbackModel || "المحدد"} غير متاح في المشروع الحالي (404): ` + msg.slice(0, 200),
       "gemini_model_not_allowed",
       404,
     );
   }
   if (status === 400 || /INVALID_ARGUMENT/i.test(msg)) {
     return new ProductionUnavailable(
-      "طلب غير مقبول من Gemini (400): " + msg.slice(0, 180),
+      "طلب غير مقبول من Gemini (400): " + msg.slice(0, 200),
       "gemini_bad_request",
       400,
     );
   }
   if (typeof status === "number" && status >= 500) {
     return new ProductionUnavailable(
-      `خدمة Gemini أعادت حالة HTTP ${status}. يمكن الاستئناف تلقائيًا بعد ثوانٍ.`,
+      `خدمة Gemini أعادت حالة HTTP ${status}: ` + msg.slice(0, 200),
       "gemini_request_failed",
       502,
     );
   }
   return new ProductionUnavailable(
-    "تعذّر الاتصال بـ Gemini: " + (msg.slice(0, 180) || "خطأ شبكة"),
+    "تعذّر الاتصال بـ Gemini: " + (msg.slice(0, 200) || "خطأ شبكة"),
     "gemini_network",
     503,
   );

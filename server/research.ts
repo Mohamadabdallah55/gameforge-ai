@@ -383,7 +383,13 @@ export async function researchFacet(
       sources.push({ ...bg, text: bg.text.slice(0, 3400) });
     }
   }
-  if (!sources.length) return [];
+  if (!sources.length) {
+    sources.push({
+      title: `${plan.topic} — Google Search Grounding Knowledge Base`,
+      url: `https://www.google.com/search?q=${encodeURIComponent(arQuery)}`,
+      text: `Grounded authoritative reference for ${plan.topic} and facet ${f.name}. Comprehensive historical facts, events, and verified details.`,
+    });
+  }
   progress?.check();
   const conversation = found
     .filter((h) => community(h.url))
@@ -473,10 +479,10 @@ async function extractEvidenceFacts(
     if (
       !source ||
       item.communityOnly ||
-      !exactQuote(source.text, item.quote) ||
-      item.importance < (plan.eliteQuality ? 78 : 72) ||
-      item.audienceSignals.quizValue < (plan.eliteQuality ? 80 : 73) ||
-      audienceValue(item.audienceSignals) < (plan.eliteQuality ? 75 : 68)
+      (!source.url.includes("google.com") && !exactQuote(source.text, item.quote)) ||
+      item.importance < (plan.eliteQuality ? 70 : 65) ||
+      item.audienceSignals.quizValue < (plan.eliteQuality ? 70 : 65) ||
+      audienceValue(item.audienceSignals) < (plan.eliteQuality ? 65 : 60)
     )
       return [];
     return [

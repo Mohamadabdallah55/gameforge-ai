@@ -9,4 +9,17 @@ export default defineConfig({
     allowedHosts: true,
     hmr: false,
   },
+  build: {
+    rollupOptions: {
+      onwarn(warning, warn) {
+        if (
+          warning.code === "MODULE_LEVEL_DIRECTIVE" &&
+          /use client/i.test(warning.message)
+        ) {
+          return;
+        }
+        warn(warning);
+      },
+    },
+  },
 });
