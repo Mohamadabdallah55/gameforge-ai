@@ -92,8 +92,6 @@ export function isPaidApproved(): boolean {
 }
 
 export function isGeminiSetupConfirmed(): boolean {
-  // Respect explicit "0" opt-out used by local safety tests / offline verification,
-  // while enabling AI Studio cloud usage automatically once a key is injected in Secrets.
   return process.env.GEMINI_FREE_PROJECT_CONFIRMED !== "0";
 }
 

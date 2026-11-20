@@ -89,7 +89,7 @@ export interface Asset {
   origin: string;
   credit: string;
   license: string;
-  rightsStatus?: "reusable" | "user-authorized" | "generated";
+  rightsStatus?: "reusable" | "user-authorized" | "generated" | "attributed";
   originalId?: string;
   transformation?: string;
 }
@@ -181,6 +181,6 @@ export interface Job {
   qualityRetries?: number;
   chatgpt?: { account: string; model: string };
   pauseCode?: string;
-  production?: { provider: "gemini"; model: string };
+  production?: { provider: "gemini" | "web-engine"; model: string };
   metrics?: { sourcesChecked: number; imagesReviewed: number };
 }

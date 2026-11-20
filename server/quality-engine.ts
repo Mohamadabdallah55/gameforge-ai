@@ -252,13 +252,7 @@ export class QualityEngine {
           !reserved.has(f.id) &&
           (fast ||
             (usedSources.get(f.sourceLabel) || 0) <
-              Math.max(
-                2,
-                Math.ceil(
-                  schedule.length *
-                    (f.sourceLabel.endsWith("wikipedia.org") ? 0.12 : 0.25),
-                ),
-              )),
+              Math.max(4, Math.ceil(schedule.length * 0.5))),
       );
     const rank = (fact: Fact, level: Level) =>
       (referencesByUrl.has(fact.source.url) ? 50 : 0) +
@@ -274,13 +268,14 @@ export class QualityEngine {
       for (let attempt = 0; attempt < (elite ? 4 : 3); attempt++) {
         if (!prepared.has(cursor)) {
           let available = availableFacts();
-          if (
+          while (
             (!available.length ||
               (!fast && state.facts.length - seenFacts.size < 3)) &&
             state.next < maxResearch
           ) {
             await expand();
             available = availableFacts();
+            if (available.length && state.facts.length - seenFacts.size >= 3) break;
           }
           if (!available.length) continue;
           if (fast) {

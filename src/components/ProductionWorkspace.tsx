@@ -109,7 +109,7 @@ export function ProductionWorkspace({
             <div>
               <h2 className="text-lg font-bold text-slate-900">خطة الأسئلة</h2>
               <p className="text-xs text-slate-500">
-                Gemini · بحث عميق متعدد المصادر، تأليف احترافي، فحص فايروول، ومراجعة مستقلة
+                AI Engines · بحث عميق متعدد المصادر، استخراج ذكي، فحص فايروول، ومراجعة مستقلة
               </p>
             </div>
             <div className="text-xs font-medium text-slate-600 tabular-nums">
@@ -222,7 +222,7 @@ export function ProductionWorkspace({
                           setPlan(targetPlan);
                           const j = await api<Job>("jobs", {
                             profileId: profile,
-                            director: "gemini",
+                            director: "auto",
                             plan: {
                               ...targetPlan,
                               brief: request.trim().slice(0, 2000),
@@ -413,7 +413,7 @@ export function ProductionWorkspace({
                       : plan;
                   const j = await api<Job>("jobs", {
                     profileId: profile,
-                    director: "gemini",
+                    director: "auto",
                     plan: { ...productionPlan, brief: brief.slice(0, 2000) },
                   });
                   setJobs((all) => [
@@ -451,7 +451,7 @@ export function ProductionWorkspace({
             </li>
             <li>
               <strong className="block text-slate-900">4. تدقيق بصري للصور</strong>
-              فحص Gemini Vision لكل صورة واستبعاد الشعارات أو النصوص الفاضحة ومصادر ويكيميديا المحظورة.
+              فحص بصري ذكي لكل صورة واستبعاد الشعارات أو النصوص الفاضحة ومصادر ويكيميديا المحظورة.
             </li>
           </ul>
         </aside>
@@ -497,7 +497,12 @@ export function ProductionWorkspace({
                       </div>
                       <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-600">
                         {j.production && (
-                          <span>Gemini · {j.production.model}</span>
+                          <span>
+                            {j.production.provider === "web-engine"
+                              ? "محرك الاستخراج الذكي"
+                              : "Gemini"}{" "}
+                            · {j.production.model}
+                          </span>
                         )}
                         {j.chatgpt && (
                           <span>ChatGPT · {j.chatgpt.model}</span>

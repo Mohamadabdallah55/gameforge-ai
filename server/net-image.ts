@@ -19,10 +19,12 @@ const cooldown = new Map<string, number>();
 async function publicResource(
   raw: string,
   agent: string,
+  accept: string,
   media: RegExp,
   limit: number,
   timeout = 25000,
-) {
+  redirectsLeft = 3,
+): Promise<Buffer> {
   const url = new URL(raw);
   if (
     url.protocol !== "https:" ||
@@ -40,12 +42,45 @@ async function publicResource(
     const req = request(
       url,
       {
-        headers: { "User-Agent": agent },
+        headers: {
+          "User-Agent": agent,
+          Accept: accept,
+          "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+        },
         family: 4,
         lookup: (_host, _options, cb) => cb(null, address, 4),
         signal: AbortSignal.timeout(timeout),
       },
       (res) => {
+        if (
+          res.statusCode &&
+          [301, 302, 303, 307, 308].includes(res.statusCode) &&
+          res.headers.location &&
+          redirectsLeft > 0
+        ) {
+          res.destroy();
+          try {
+            const next = new URL(res.headers.location, url);
+            if (next.protocol !== "https:") {
+              reject(Error("إعادة توجيه غير آمنة"));
+              return;
+            }
+            resolve(
+              publicResource(
+                next.toString(),
+                agent,
+                accept,
+                media,
+                limit,
+                timeout,
+                redirectsLeft - 1,
+              ),
+            );
+          } catch (err) {
+            reject(err);
+          }
+          return;
+        }
         if (res.statusCode === 429) {
           const retry = String(res.headers["retry-after"] || "60");
           cooldown.set(
@@ -87,6 +122,19 @@ async function publicResource(
 }
 
 export const publicImage = (url: string, agent: string) =>
-  publicResource(url, agent, /^image\/(jpeg|png|webp|gif|avif)\b/i, 20e6);
+  publicResource(
+    url,
+    agent,
+    "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
+    /^image\/(jpeg|jpg|png|webp|gif|avif)\b/i,
+    20e6,
+  );
 export const publicArticle = (url: string, agent: string) =>
-  publicResource(url, agent, /^text\/html\b/i, 2e6, 10000);
+  publicResource(
+    url,
+    agent,
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    /^text\/html\b/i,
+    2e6,
+    10000,
+  );

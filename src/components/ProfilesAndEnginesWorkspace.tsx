@@ -289,6 +289,12 @@ export function EnginesWorkspace({
           {engine.model}
         </p>
 
+        {engine.name === "Web Extraction & Question Engine" && engine.connected && (
+          <p className="rounded-md border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-xs text-emerald-950">
+            يعمل تلقائيًا بدون مفتاح API: تحليل الطلبات العربية، الاستخراج التوثيقي من الويب، وفحص جودة الأسئلة والصور.
+          </p>
+        )}
+
         {engine.name === "Gemini" && engine.connected && (
           <p className="rounded-md border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-xs text-emerald-950">
             {engine.detail?.productionEnabled

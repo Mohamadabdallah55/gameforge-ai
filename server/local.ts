@@ -150,6 +150,11 @@ export function registerCloudTranslator(fn: (q: string) => Promise<string>) {
   cloudTranslator = fn;
 }
 
+let fallbackTranslator: ((q: string) => Promise<string>) | undefined;
+export function registerFallbackTranslator(fn: (q: string) => Promise<string>) {
+  fallbackTranslator = fn;
+}
+
 const translations = new Map<string, string>();
 export async function translateQuery(query: string) {
   if (!/[\u0600-\u06ff]/.test(query)) return query;
@@ -159,38 +164,53 @@ export async function translateQuery(query: string) {
   // Prefer cloud Gemini translator in AI Studio when configured and not forced local
   if (cloudTranslator && process.env.AI_PROVIDER !== "local" && getGeminiApiKey()) {
     try {
-      const translated = (await cloudTranslator(query)).trim().slice(0, 240) || query;
+      const translated = (await cloudTranslator(query)).trim().slice(0, 240);
+      if (translated && !/[\u0600-\u06ff]/.test(translated)) {
+        if (translations.size >= 512)
+          translations.delete(translations.keys().next().value!);
+        translations.set(query, translated);
+        return translated;
+      }
+    } catch {
+      // fall through cleanly to fallback / local
+    }
+  }
+
+  try {
+    return await exclusive("Ollama", async () => {
+      const r = await ollama("/api/chat", {
+        model: textModel(),
+        stream: false,
+        think: false,
+        keep_alive: 0,
+        options: { num_ctx: 2048, num_predict: 80, temperature: 0 },
+        messages: [
+          {
+            role: "system",
+            content:
+              "Translate the query to English for web search. Preserve names, years and seasons. Return just the query.",
+          },
+          { role: "user", content: query },
+        ],
+      });
+      const translated = String(r.message.content).trim().slice(0, 240) || query;
       if (translations.size >= 512)
         translations.delete(translations.keys().next().value!);
       translations.set(query, translated);
       return translated;
-    } catch {
-      // fall through cleanly
-    }
-  }
-
-  return exclusive("Ollama", async () => {
-    const r = await ollama("/api/chat", {
-      model: textModel(),
-      stream: false,
-      think: false,
-      keep_alive: 0,
-      options: { num_ctx: 2048, num_predict: 80, temperature: 0 },
-      messages: [
-        {
-          role: "system",
-          content:
-            "Translate the query to English for web search. Preserve names, years and seasons. Return just the query.",
-        },
-        { role: "user", content: query },
-      ],
     });
-    const translated = String(r.message.content).trim().slice(0, 240) || query;
-    if (translations.size >= 512)
-      translations.delete(translations.keys().next().value!);
-    translations.set(query, translated);
-    return translated;
-  });
+  } catch {
+    if (fallbackTranslator) {
+      const translated =
+        (await fallbackTranslator(query).catch(() => query)).trim().slice(0, 240) ||
+        query;
+      if (translations.size >= 512)
+        translations.delete(translations.keys().next().value!);
+      translations.set(query, translated);
+      return translated;
+    }
+    return query;
+  }
 }
 
 export const visionModel = () =>

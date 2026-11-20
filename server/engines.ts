@@ -69,6 +69,21 @@ export async function engineStatus(db: Store, gemini?: EliteGemini) {
   };
 
   const engines = await Promise.all([
+    {
+      name: "Web Extraction & Question Engine",
+      model: "Smart Arabic NLP + Verbatim Fact Extractor",
+      scope: "cloud" as const,
+      connected: true,
+      detail: {
+        mode: "zero-key",
+        capabilities: [
+          "Arabic Prompt Interpretation",
+          "Multi-Source Fact Extraction",
+          "768-D Trigram Embeddings",
+          "Sharp Visual Verification",
+        ],
+      },
+    },
     ...(gemini
       ? [
           gemini.status().then((status) => ({
@@ -76,16 +91,29 @@ export async function engineStatus(db: Store, gemini?: EliteGemini) {
             model: gemini.model,
             scope: "cloud" as const,
             ...status,
+            error:
+              !status.connected &&
+              /GEMINI_API_KEY/.test(String(status.error || ""))
+                ? "مفتاح Gemini غير مضاف (اختياري) — محرك الاستخراج الذكي السحابي يعمل تلقائيًا بدونه."
+                : status.error,
           })),
         ]
       : []),
     {
       name: "Cloud Web & Image Search",
-      model: "Bing + DuckDuckGo Images + Google News RSS + Openverse",
+      model: "Bing Web/Images + TheSportsDB + Flickr + Google News RSS + Openverse",
       scope: "cloud" as const,
       connected: true,
       detail: {
-        channels: ["Bing Web", "DuckDuckGo Images", "Bing Images", "Google News RSS", "Openverse", "NASA Archive"],
+        channels: [
+          "Bing Web",
+          "Bing Images",
+          "TheSportsDB",
+          "Flickr",
+          "Google News RSS",
+          "Openverse",
+          "NASA Archive",
+        ],
       },
     },
     {

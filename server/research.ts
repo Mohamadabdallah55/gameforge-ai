@@ -112,7 +112,7 @@ export function articleText(html: string, needles: string[]) {
   const root = contents.length ? contents : doc.children;
   const selected = DomUtils.findAll(
     (el) =>
-      ["p", "h1", "h2", "h3", "blockquote", "figcaption"].includes(el.name),
+      ["p", "h1", "h2", "h3", "blockquote", "figcaption", "li"].includes(el.name),
     root,
   );
   const words = new Set(
@@ -134,10 +134,17 @@ export function articleText(html: string, needles: string[]) {
           .filter((w) => words.has(w)).length,
       };
     })
-    .filter((p) => p.text.length >= 30 && p.text.length <= 2500);
+    .filter(
+      (p) =>
+        p.text.length >= 22 &&
+        p.text.length <= 2500 &&
+        !/cookie|sign up|log in|privacy policy|for sale|add to cart|buy now/i.test(
+          p.text,
+        ),
+    );
   const relevant = best
     .sort((a, b) => b.rank - a.rank || a.i - b.i)
-    .slice(0, 12)
+    .slice(0, 14)
     .sort((a, b) => a.i - b.i);
   const captions = DomUtils.getElementsByTagName("meta", doc.children)
     .filter((tag) =>
@@ -267,11 +274,7 @@ export async function researchFacet(
     x.status === "fulfilled" ? x.value : [],
   );
   progress?.check();
-  const matches = found.filter(
-    (h) =>
-      !community(h.url) &&
-      (chatgptDirected || !sourceHost(h.url).endsWith("wikipedia.org")),
-  );
+  const matches = found.filter((h) => !community(h.url));
   const names = [state.map.arabicSubject, state.map.englishSubject]
     .filter(Boolean)
     .map(normalize);
@@ -291,6 +294,8 @@ export async function researchFacet(
     (a, b) =>
       Number(relevant(b.title + " " + b.text)) -
         Number(relevant(a.title + " " + a.text)) ||
+      Number(!sourceHost(b.url).endsWith("wikipedia.org")) -
+        Number(!sourceHost(a.url).endsWith("wikipedia.org")) ||
       Number(domains.includes(sourceHost(b.url))) -
         Number(domains.includes(sourceHost(a.url))),
   );
@@ -324,15 +329,27 @@ export async function researchFacet(
   for (let i = 0; i < candidates.length && sources.length < 3; i += 3) {
     const batch = await Promise.allSettled(
       candidates.slice(i, i + 3).map(async (hit) => {
-        const html = await articleBytes(hit.url);
-        const text = articleText(html, [
-          f.name,
-          enQuery,
-          arQuery,
-          ...(state.map.scopeMarkers || []),
-        ]);
+        if (sourceHost(hit.url) === "thesportsdb.com" && hit.text.length >= 250) {
+          progress?.sourceRead();
+          return { ...hit, text: hit.text.slice(0, 2900) };
+        }
+        const html = await articleBytes(hit.url).catch(() => "");
+        const extracted = html
+          ? articleText(html, [
+              f.name,
+              enQuery,
+              arQuery,
+              ...(state.map.scopeMarkers || []),
+            ])
+          : "";
+        const text =
+          extracted.length >= 180
+            ? extracted
+            : hit.text && hit.text.trim().length >= 75
+              ? hit.text.trim()
+              : extracted;
         if (text.length) progress?.sourceRead();
-        return text.length >= 180 &&
+        return text.length >= 75 &&
           (chatgptDirected || relevant(hit.title + " " + text))
           ? { ...hit, text: text.slice(0, 2900) }
           : null;
@@ -344,26 +361,29 @@ export async function researchFacet(
       ),
     );
   }
-  if (!chatgptDirected && sources.length < 2) {
-    const background = (await fallback(enQuery)).filter(
+  const hasDeepEncyclopedia = sources.some(
+    (s) =>
+      s.text.length >= 900 ||
+      sourceHost(s.url).endsWith("wikipedia.org") ||
+      sourceHost(s.url).includes("nasa.gov") ||
+      sourceHost(s.url).includes("britannica.com"),
+  );
+  if (!chatgptDirected && (sources.length < 3 || !hasDeepEncyclopedia)) {
+    const bgQuery = /[\u0600-\u06ff]/.test(arQuery) ? arQuery : enQuery;
+    const background = (await fallback(bgQuery).catch(() => [])).filter(
       (x) =>
-        sourceHost(x.url).endsWith("wikipedia.org") &&
+        x.text.trim().length >= 120 &&
         relevant(x.title + " " + x.text),
     );
-    sources.push(
-      ...background
-        .slice(0, 1)
-        .map((x) => ({ ...x, text: x.text.slice(0, 2400) })),
-    );
+    const seenUrls = new Set(sources.map((s) => s.url));
+    for (const bg of background) {
+      if (sources.length >= 4) break;
+      if (seenUrls.has(bg.url)) continue;
+      seenUrls.add(bg.url);
+      sources.push({ ...bg, text: bg.text.slice(0, 3400) });
+    }
   }
-  if (
-    !sources.length ||
-    (plan.eliteQuality &&
-      sources.every((source) =>
-        sourceHost(source.url).endsWith("wikipedia.org"),
-      ))
-  )
-    return [];
+  if (!sources.length) return [];
   progress?.check();
   const conversation = found
     .filter((h) => community(h.url))
@@ -374,7 +394,7 @@ export async function researchFacet(
     plan,
     state.map,
     f.name,
-    sources.slice(0, 3),
+    sources.slice(0, 4),
     conversation,
     factLimit,
     editorial,

@@ -68,10 +68,20 @@ export class EliteGemini extends StructuredProvider {
   private checkedModel = "";
   private lastSuccess?: number;
   private lastFailure?: string;
+  private degradedUntil = 0;
   private searchGroundingSupported?: boolean;
 
   private activeKey?: string;
   private activeKeySource?: "MY_CUSTOM_GEMINI_KEY" | "GEMINI_API_KEY";
+
+  isDegraded(): boolean {
+    return Date.now() < this.degradedUntil;
+  }
+
+  markDegraded(reason: string, durationMs = 120_000) {
+    this.lastFailure = reason;
+    this.degradedUntil = Date.now() + durationMs;
+  }
 
   constructor(
     private local: LocalProvider,
@@ -113,6 +123,13 @@ export class EliteGemini extends StructuredProvider {
       throw new ProductionUnavailable(
         `تحتاج المهمة إلى إصدار Gemini الأصلي (${expectedModel})، بينما المحرك الحالي مضبوط على (${this.model}).`,
         "gemini_model_changed",
+      );
+    }
+    if (this.isDegraded()) {
+      throw new ProductionUnavailable(
+        this.lastFailure || "خدمة Gemini غير متاحة مؤقتًا.",
+        "gemini_request_failed",
+        503,
       );
     }
     await this.checkCatalog();
@@ -276,6 +293,7 @@ export class EliteGemini extends StructuredProvider {
         this.activeKeySource = candidate.source;
         this.lastSuccess = Date.now();
         this.lastFailure = undefined;
+        this.degradedUntil = 0;
         this.db.db
           .prepare("INSERT OR REPLACE INTO search_cache VALUES(?,?,?)")
           .run(cacheKey, JSON.stringify(result), Date.now() + 24 * 3600_000);
@@ -295,6 +313,17 @@ export class EliteGemini extends StructuredProvider {
         }
         lastMapped = mapGeminiError(error, targetModel);
         this.lastFailure = lastMapped.message;
+        if (
+          [
+            "gemini_request_failed",
+            "gemini_network",
+            "gemini_quota",
+            "gemini_access",
+            "gemini_model_not_allowed",
+          ].includes(lastMapped.code)
+        ) {
+          this.markDegraded(lastMapped.message);
+        }
         if (!["gemini_access", "gemini_quota"].includes(lastMapped.code)) {
           throw lastMapped;
         }
@@ -339,8 +368,8 @@ export class EliteGemini extends StructuredProvider {
         .prepare("INSERT OR REPLACE INTO search_cache VALUES(?,?,?)")
         .run(cacheKey, res.query, Date.now() + 7 * 24 * 3600_000);
       return res.query;
-    } catch {
-      return query;
+    } catch (error) {
+      throw error;
     }
   }
 

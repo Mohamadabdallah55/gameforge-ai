@@ -22,8 +22,10 @@ import {
   embedModel,
   LocalProvider,
   registerCloudTranslator,
+  registerFallbackTranslator,
 } from "./local";
 import { EliteGemini } from "./elite-gemini";
+import { WebExtractionProvider } from "./web-engine";
 import { ProductionUnavailable } from "./production-state";
 import { engineStatus } from "./engines";
 import { output, infer } from "./files";
@@ -39,6 +41,7 @@ import {
 import { artisticPrompts, transform, styles } from "./media";
 import {
   getGeminiApiKey,
+  isGeminiSetupConfirmed,
   isPaidApproved,
 } from "./gemini-client";
 import {
@@ -83,8 +86,14 @@ export function createApp(db: Store, ai?: Provider) {
   );
   const local = new LocalProvider();
   const gemini = new EliteGemini(local, db);
+  const webEngine = new WebExtractionProvider();
+  const hasGemini = () => Boolean(getGeminiApiKey()) && isGeminiSetupConfirmed();
+  const hasHealthyGemini = () => hasGemini() && !gemini.isDegraded();
   registerCloudTranslator((q) => gemini.translateQuery(q));
-  registerGroundedSearch((q) => gemini.searchGroundedWeb(q));
+  registerFallbackTranslator((q) => webEngine.translateQuery(q));
+  registerGroundedSearch((q) =>
+    hasHealthyGemini() ? gemini.searchGroundedWeb(q) : Promise.resolve([]),
+  );
 
   const searchFacts = (term: string) => information(term, false);
   const elite = new QualityEngine(
@@ -93,25 +102,76 @@ export function createApp(db: Store, ai?: Provider) {
     searchFacts,
     gemini.assessPicture.bind(gemini),
   );
+  const eliteWeb = new QualityEngine(
+    db,
+    webEngine,
+    searchFacts,
+    webEngine.assessPicture.bind(webEngine),
+  );
+  const activeEmbedModel = () =>
+    hasHealthyGemini()
+      ? "gemini:" + gemini.embedModelName + ":768"
+      : webEngine.embedModelName;
   const worker = new Worker(
     db,
     local,
     searchFacts,
-    "gemini:" + gemini.embedModelName + ":768",
+    activeEmbedModel(),
     undefined,
     undefined,
     async (job) => {
       if (!job.production) {
         if (job.chatgpt) requirePlanUsage();
         throw new ProductionUnavailable(
-          "هذه مهمة قديمة مرتبطة بمحركها الأصلي. أنشئ مهمة Gemini جديدة لاستعمال وضع Elite.",
+          "هذه مهمة قديمة مرتبطة بمحركها الأصلي. أنشئ مهمة إنتاج جديدة.",
           "legacy_engine",
         );
       }
-      await gemini.ready(job.production.model);
-      await elite.run(job, "gemini:" + gemini.embedModelName + ":768");
+      if (job.production.provider === "web-engine") {
+        await eliteWeb.run(job, webEngine.embedModelName);
+        return;
+      }
+      if (!hasHealthyGemini()) {
+        job.production = {
+          provider: "web-engine",
+          model: webEngine.modelName,
+        };
+        db.saveJob(job);
+        await eliteWeb.run(job, webEngine.embedModelName);
+        return;
+      }
+      try {
+        await gemini.ready(job.production.model);
+        await elite.run(job, "gemini:" + gemini.embedModelName + ":768");
+      } catch (err) {
+        if (
+          err instanceof ProductionUnavailable &&
+          err.code !== "gemini_paid_approval_required"
+        ) {
+          gemini.markDegraded(err.message);
+          job.production = {
+            provider: "web-engine",
+            model: webEngine.modelName,
+          };
+          db.saveJob(job);
+          await eliteWeb.run(job, webEngine.embedModelName);
+          return;
+        }
+        throw err;
+      }
     },
-    getGeminiApiKey() ? gemini.assessPicture.bind(gemini) : undefined,
+    async (context, source, png) => {
+      if (hasHealthyGemini()) {
+        try {
+          return await gemini.assessPicture(context, source, png);
+        } catch (err) {
+          if (err instanceof ProductionUnavailable) {
+            gemini.markDegraded(err.message);
+          }
+        }
+      }
+      return webEngine.assessPicture(context, source, png);
+    },
   );
 
   api.use((req, res, next) => {
@@ -177,8 +237,18 @@ export function createApp(db: Store, ai?: Provider) {
   api.get("/engines", async (_, r) => r.json(await engineStatus(db, gemini)));
 
   api.get("/production/eligibility", async (_, r) => {
-    await gemini.ready();
-    r.json({ model: gemini.model });
+    if (hasHealthyGemini()) {
+      try {
+        await gemini.ready();
+        r.json({ model: gemini.model, provider: "gemini" });
+        return;
+      } catch (err) {
+        if (err instanceof ProductionUnavailable) {
+          gemini.markDegraded(err.message);
+        }
+      }
+    }
+    r.json({ model: webEngine.modelName, provider: "web-engine" });
   });
 
   api.post("/engines/restart", (q, r) => {
@@ -255,9 +325,9 @@ export function createApp(db: Store, ai?: Provider) {
       r.status(422).json({ error: fw.reason, stage: fw.stage });
       return;
     }
-    const vector = getGeminiApiKey()
-      ? await gemini.embed(input.question).catch(() => [1, 0])
-      : [1, 0];
+    const vector = hasGemini()
+      ? await gemini.embed(input.question).catch(() => webEngine.embed(input.question))
+      : await webEngine.embed(input.question);
     const item: Question = {
       id: uid(),
       profileId: pid,
@@ -268,7 +338,7 @@ export function createApp(db: Store, ai?: Provider) {
       quote: input.quote || "",
       image: input.image ?? null,
     };
-    db.add(item, vector, getGeminiApiKey() ? "gemini:" + gemini.embedModelName + ":768" : undefined);
+    db.add(item, vector, activeEmbedModel());
     r.status(201).json(item);
   });
 
@@ -310,16 +380,17 @@ export function createApp(db: Store, ai?: Provider) {
       return;
     }
     const textChanged = next.question !== current.question;
-    const vector =
-      textChanged && getGeminiApiKey()
-        ? await gemini.embed(next.question).catch(() => undefined)
-        : undefined;
+    const vector = textChanged
+      ? hasGemini()
+        ? await gemini.embed(next.question).catch(() => webEngine.embed(next.question))
+        : await webEngine.embed(next.question)
+      : undefined;
     const saved = db.updateQuestion(
       current.id,
       pid,
       next,
       vector,
-      vector ? "gemini:" + gemini.embedModelName + ":768" : undefined,
+      vector ? activeEmbedModel() : undefined,
     );
     r.json(saved);
   });
@@ -400,7 +471,7 @@ export function createApp(db: Store, ai?: Provider) {
 
   const brief = z.object({
     request: term,
-    director: z.enum(["auto", "local", "gemini"]).optional(),
+    director: z.enum(["auto", "local", "gemini", "web-engine"]).optional(),
     profileId: z.string().default("default"),
   });
 
@@ -416,11 +487,21 @@ export function createApp(db: Store, ai?: Provider) {
         return;
       }
     }
-    if (ai && !getGeminiApiKey()) {
+    if (ai && !hasHealthyGemini()) {
       r.json(await ai.interpret(input.request));
       return;
     }
-    r.json(await gemini.interpret(input.request));
+    if (input.director !== "web-engine" && hasHealthyGemini()) {
+      try {
+        r.json(await gemini.interpret(input.request));
+        return;
+      } catch (err) {
+        if (err instanceof ProductionUnavailable) {
+          gemini.markDegraded(err.message);
+        }
+      }
+    }
+    r.json(await webEngine.interpret(input.request));
   });
 
   api.post("/assistant", async (q, r) => {
@@ -444,16 +525,25 @@ export function createApp(db: Store, ai?: Provider) {
         status: j.status,
         done: j.done,
       }));
-    r.json(
-      await gemini.copilot(input.request, {
-        profileName: prof.name,
-        profileRules: prof.rules,
-        questionCount: db.questions(pid).length,
-        assetCount: db.assets().length,
-        activeJobs: profJobs,
-        cloudMode: isCloudEnvironment(),
-      }),
-    );
+    const context = {
+      profileName: prof.name,
+      profileRules: prof.rules,
+      questionCount: db.questions(pid).length,
+      assetCount: db.assets().length,
+      activeJobs: profJobs,
+      cloudMode: isCloudEnvironment(),
+    };
+    if (input.director !== "web-engine" && hasHealthyGemini()) {
+      try {
+        r.json(await gemini.copilot(input.request, context));
+        return;
+      } catch (err) {
+        if (err instanceof ProductionUnavailable) {
+          gemini.markDegraded(err.message);
+        }
+      }
+    }
+    r.json(await webEngine.copilot(input.request, context));
   });
 
   api.post("/assets/from-search", async (q, r) => {
@@ -461,12 +551,12 @@ export function createApp(db: Store, ai?: Provider) {
       origin = term.parse(q.body.origin);
     const hit = (await pictures(query)).find((h) => h.origin === origin);
     if (!hit) throw Error("انتهت نتيجة البحث. أعد البحث عن الصورة.");
-    const meta = {
+    const meta: Asset = {
       id: uid(),
       origin: hit.origin,
       credit: hit.credit,
       license: hit.license,
-      rightsStatus: "reusable" as const,
+      rightsStatus: hit.rightsStatus === "attributed" ? "attributed" : "reusable",
     };
     db.putAsset(meta, await transform(await downloadHit(hit), "original"));
     r.status(201).json(meta);
@@ -607,20 +697,39 @@ export function createApp(db: Store, ai?: Provider) {
   api.get("/jobs", (_, r) => r.json(db.jobs()));
 
   api.post("/jobs", async (q, r) => {
-    if (q.body.director !== undefined && q.body.director !== "gemini")
+    if (
+      q.body.director !== undefined &&
+      q.body.director !== "auto" &&
+      q.body.director !== "gemini" &&
+      q.body.director !== "web-engine"
+    )
       throw new ProductionUnavailable(
-        "صياغة أسئلة Elite تحتاج إلى اختيار Gemini. تبقى وظائف Ollama المساعدة متاحة محليًا.",
+        "صياغة أسئلة Elite تستخدم محرك الاستخراج الذكي السحابي أو Gemini.",
         "unsupported_production_director",
         409,
       );
     const profileId = profile(q.body.profileId);
     const plan = planSchema.parse(q.body.plan);
-    await gemini.ready();
+    if (q.body.director === "gemini" && !hasGemini()) {
+      await gemini.ready();
+    }
+    let useGemini =
+      q.body.director !== "web-engine" && hasHealthyGemini();
+    if (useGemini) {
+      try {
+        await gemini.ready();
+      } catch (err) {
+        if (q.body.director === "gemini" && !hasGemini()) throw err;
+        useGemini = false;
+      }
+    }
     const j = worker.enqueue(
       profileId,
       { ...plan, eliteQuality: true },
       undefined,
-      { provider: "gemini", model: gemini.model },
+      useGemini
+        ? { provider: "gemini", model: gemini.model }
+        : { provider: "web-engine", model: webEngine.modelName },
     );
     r.status(202).json(j);
     void worker.drain();
@@ -670,10 +779,25 @@ export function createApp(db: Store, ai?: Provider) {
     if (!j.imageQuestionIds) {
       if (!j.production)
         throw new ProductionUnavailable(
-          "أنشئ مهمة Gemini جديدة بدل إعادة تشغيل مهمة بمحرك قديم.",
+          "أنشئ مهمة إنتاج جديدة بدل إعادة تشغيل مهمة بمحرك قديم.",
           "legacy_engine",
         );
-      await gemini.ready(j.production.model);
+      if (j.production.provider === "gemini") {
+        let canUseGemini = hasHealthyGemini();
+        if (canUseGemini) {
+          try {
+            await gemini.ready(j.production.model);
+          } catch {
+            canUseGemini = false;
+          }
+        }
+        if (!canUseGemini) {
+          j.production = {
+            provider: "web-engine",
+            model: webEngine.modelName,
+          };
+        }
+      }
     }
     if (!["failed", "paused"].includes(db.job(j.id)?.status || "")) {
       r.status(409).json({ error: "تغيرت حالة المهمة. حدّث الصفحة." });

@@ -115,33 +115,40 @@ export async function realPicture(
     );
   for (const search of pictureQueries(query, target)) {
     options.check?.();
-    const candidates = (await pictures(search)).sort(
+    const candidates = (await pictures(search, { allowAttributed: true })).sort(
       (a, b) => preferred(b.origin) - preferred(a.origin),
     );
     for (const hit of candidates
-      .filter((h) => !checked.has(h.origin))
-      .slice(0, 4)) {
+      .filter((h) => !checked.has(h.origin + "|" + (h.original || h.url)))
+      .slice(0, 6)) {
       options.check?.();
-      checked.add(hit.origin);
+      checked.add(hit.origin + "|" + (hit.original || hit.url));
       try {
         const bytes = await downloadHit(hit);
         const pipeline = sharp(bytes, { limitInputPixels: 24e6 });
         const { width = 0, height = 0 } = await pipeline.metadata();
-        if (Math.max(width, height) < 960 || Math.min(width, height) < 480) {
+        if (Math.max(width, height) < 400 || Math.min(width, height) < 250) {
           reasons.add("الدقة أقل من الحد المطلوب");
           continue;
         }
-        const sourceText =
+        const fetchedArticle =
           hit.publisherCaption ||
-          articleText(await articleBytes(hit.origin), [
+          articleText(await articleBytes(hit.origin).catch(() => ""), [
             search,
             ...(target.recognition ? [target.answer] : []),
             target.event,
           ]).slice(0, 950);
-        const sourceContext = [hit.title, hit.description, sourceText]
+        const sourceText =
+          fetchedArticle || hit.description || hit.title || hit.credit || "";
+        const sourceContext = [
+          hit.title,
+          hit.description,
+          hit.credit,
+          sourceText,
+        ]
           .filter(Boolean)
           .join("\n");
-        if (!sourceText || normalize(sourceContext).length < 55) {
+        if (!sourceText || normalize(sourceContext).length < 18) {
           reasons.add("لا يوجد سياق أو تعليق أصلي قابل للتحقق");
           continue;
         }
@@ -158,7 +165,8 @@ export async function realPicture(
             origin: hit.origin,
             credit: hit.credit,
             license: hit.license,
-            rightsStatus: "reusable",
+            rightsStatus:
+              hit.rightsStatus === "attributed" ? "attributed" : "reusable",
           },
           visual,
           sourceContext,
