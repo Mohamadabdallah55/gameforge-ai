@@ -324,6 +324,94 @@ export class Store {
       .prepare("INSERT INTO assets VALUES(?,?,?)")
       .run(meta.id, JSON.stringify(meta), png);
   }
+  updateQuestion(
+    id: string,
+    profileId: string,
+    next: Question,
+    vector?: number[],
+    model?: string,
+  ) {
+    const existing = this.question(id, profileId);
+    if (!existing) throw Error("السؤال غير موجود");
+    const nextNorm = normalize(next.question);
+    const conflict = this.db
+      .prepare("SELECT id FROM questions WHERE profile=? AND norm=? AND id<>?")
+      .get(profileId, nextNorm, id);
+    if (conflict) throw Error("يوجد سؤال مطابق بالفعل في هذا الملف.");
+    this.transaction(() => {
+      if (vector) {
+        this.db
+          .prepare(
+            "UPDATE questions SET norm=?, body=?, vector=? WHERE id=? AND profile=?",
+          )
+          .run(nextNorm, JSON.stringify(next), JSON.stringify(vector), id, profileId);
+        if (model) {
+          this.db
+            .prepare("INSERT OR REPLACE INTO embedding_models VALUES(?,?)")
+            .run(id, model);
+        }
+      } else {
+        this.db
+          .prepare("UPDATE questions SET norm=?, body=? WHERE id=? AND profile=?")
+          .run(nextNorm, JSON.stringify(next), id, profileId);
+      }
+    });
+    return next;
+  }
+  deleteQuestion(id: string, profileId: string) {
+    const existing = this.question(id, profileId);
+    if (!existing) return false;
+    this.transaction(() => {
+      this.db
+        .prepare("DELETE FROM quality_accepted WHERE question=?")
+        .run(id);
+      this.db
+        .prepare("DELETE FROM quality_fingerprints WHERE question=?")
+        .run(id);
+      this.db.prepare("DELETE FROM embedding_models WHERE id=?").run(id);
+      this.db
+        .prepare("DELETE FROM questions WHERE id=? AND profile=?")
+        .run(id, profileId);
+    });
+    return true;
+  }
+  bulkDeleteQuestions(ids: string[], profileId: string) {
+    let removed = 0;
+    this.transaction(() => {
+      for (const id of ids) {
+        const res = this.db
+          .prepare("DELETE FROM questions WHERE id=? AND profile=?")
+          .run(id, profileId);
+        if (res.changes) {
+          removed++;
+          this.db
+            .prepare("DELETE FROM quality_accepted WHERE question=?")
+            .run(id);
+          this.db
+            .prepare("DELETE FROM quality_fingerprints WHERE question=?")
+            .run(id);
+          this.db.prepare("DELETE FROM embedding_models WHERE id=?").run(id);
+        }
+      }
+    });
+    return removed;
+  }
+  profileAudits(profileId: string, limit = 120) {
+    const rows = this.db
+      .prepare(
+        "SELECT a.id, a.job, a.stage, a.body FROM quality_audit a JOIN jobs j ON j.id=a.job WHERE j.profile=? ORDER BY a.id DESC LIMIT ?",
+      )
+      .all(profileId, limit);
+    return rows.map((r) => {
+      const parsed = JSON.parse(String(r.body)) as QualityRejection;
+      return {
+        ...parsed,
+        id: Number(r.id),
+        jobId: String(r.job),
+        stage: parsed.stage || String(r.stage),
+      };
+    });
+  }
   transaction(fn: () => void) {
     this.db.exec("BEGIN IMMEDIATE");
     try {

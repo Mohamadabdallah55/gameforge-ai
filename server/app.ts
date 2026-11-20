@@ -10,12 +10,19 @@ import { Store, uid } from "./store";
 import { Worker } from "./worker";
 import {
   artModes,
+  fields,
+  levels,
   planSchema,
   profileSchema,
   type Asset,
   type Provider,
+  type Question,
 } from "../shared/contracts";
-import { embedModel, LocalProvider } from "./local";
+import {
+  embedModel,
+  LocalProvider,
+  registerCloudTranslator,
+} from "./local";
 import { EliteGemini } from "./elite-gemini";
 import { ProductionUnavailable } from "./production-state";
 import { engineStatus } from "./engines";
@@ -26,9 +33,36 @@ import {
   imagePosts,
   persistSearch,
   downloadHit,
+  downloadAuthorizedWebImage,
+  registerGroundedSearch,
 } from "./search";
 import { artisticPrompts, transform, styles } from "./media";
-export function createApp(db: Store, ai: Provider = new LocalProvider()) {
+import {
+  getGeminiApiKey,
+  isPaidApproved,
+} from "./gemini-client";
+import {
+  isCloudEnvironment,
+  probeLoopbackService,
+} from "./environment";
+import { runQuestionFirewall } from "./quality-firewall";
+import type { ResearchState } from "./research";
+
+function isAllowedHost(rawHost: string): boolean {
+  const host = rawHost.split(":")[0].toLowerCase();
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host === "[::1]" ||
+    host.endsWith(".run.app") ||
+    host.endsWith(".aistudio.google.com") ||
+    host.endsWith(".googleusercontent.com") ||
+    host.endsWith(".web.app")
+  );
+}
+
+export function createApp(db: Store, ai?: Provider) {
   persistSearch(db);
   const app = express();
   const api = express.Router();
@@ -49,6 +83,9 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
   );
   const local = new LocalProvider();
   const gemini = new EliteGemini(local, db);
+  registerCloudTranslator((q) => gemini.translateQuery(q));
+  registerGroundedSearch((q) => gemini.searchGroundedWeb(q));
+
   const searchFacts = (term: string) => information(term, false);
   const elite = new QualityEngine(
     db,
@@ -60,7 +97,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     db,
     local,
     searchFacts,
-    "ollama:" + embedModel(),
+    "gemini:" + gemini.embedModelName + ":768",
     undefined,
     undefined,
     async (job) => {
@@ -72,28 +109,40 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
         );
       }
       await gemini.ready(job.production.model);
-      await elite.run(job, "ollama:" + embedModel());
+      await elite.run(job, "gemini:" + gemini.embedModelName + ":768");
     },
+    getGeminiApiKey() ? gemini.assessPicture.bind(gemini) : undefined,
   );
+
   api.use((req, res, next) => {
+    const reqHost = req.get("x-forwarded-host") || req.get("host") || "";
     const origin = req.get("origin");
     if (
       (!process.env.HOST || process.env.HOST === "127.0.0.1") &&
-      !/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(req.get("host") || "")
+      reqHost &&
+      !isAllowedHost(reqHost)
     ) {
       res.sendStatus(403);
       return;
     }
-    if (
-      req.method !== "GET" &&
-      origin &&
-      new URL(origin).host !== req.get("host")
-    ) {
-      res.sendStatus(403);
-      return;
+    if (req.method !== "GET" && origin) {
+      try {
+        const originHost = new URL(origin).host;
+        const expectedHosts = [req.get("host"), req.get("x-forwarded-host")].filter(
+          Boolean,
+        );
+        if (expectedHosts.length && !expectedHosts.includes(originHost)) {
+          res.sendStatus(403);
+          return;
+        }
+      } catch {
+        res.sendStatus(403);
+        return;
+      }
     }
     next();
   });
+
   api.use(express.json({ limit: "20mb" }));
   api.use((q, r, next) => {
     if (q.body?.director === "chatgpt") requirePlanUsage();
@@ -103,6 +152,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     "/chatgpt",
     chatGPTRoutes(chatgpt, planUsageEnabled, requirePlanUsage),
   );
+
   const term = z.string().trim().min(1).max(2000);
   const id = z.string().regex(/^(default|[0-9a-f-]{36})$/);
   const profile = (v: unknown) => {
@@ -115,6 +165,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     .min(4)
     .max(16e6)
     .regex(/^[A-Za-z0-9+/]+={0,2}$/);
+
   api.get("/health", (_, r) =>
     r.json({
       ok: true,
@@ -122,11 +173,14 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
       chatgptPlanUsage: planUsageEnabled,
     }),
   );
+
   api.get("/engines", async (_, r) => r.json(await engineStatus(db, gemini)));
+
   api.get("/production/eligibility", async (_, r) => {
     await gemini.ready();
     r.json({ model: gemini.model });
   });
+
   api.post("/engines/restart", (q, r) => {
     const restart = z.enum(["ollama", "comfy", "searx"]).parse(q.body.engine);
     if (!process.send) {
@@ -142,18 +196,29 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     process.send({ restart });
     r.status(202).json({ restart });
   });
+
   api.post("/jobs/images", (q, r) => {
     const j = worker.enqueueImages(profile(q.body.profileId));
     r.status(202).json(j);
     void worker.drain();
   });
+
   api.get("/profiles", (_, r) => r.json(db.profiles()));
+
   api.post("/profiles", (q, r) => {
     const p = profileSchema.parse(q.body),
       k = uid();
     db.saveProfile(k, p);
     r.status(201).json({ id: k, ...p });
   });
+
+  api.patch("/profiles/:id", (q, r) => {
+    const k = profile(q.params.id);
+    const p = profileSchema.parse(q.body);
+    db.saveProfile(k, p);
+    r.json({ id: k, ...p });
+  });
+
   api.get("/questions", (q, r) =>
     r.json(
       db
@@ -165,11 +230,151 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
         ),
     ),
   );
+
+  api.post("/questions", async (q, r) => {
+    const input = z
+      .object({
+        profileId: z.string().default("default"),
+        question: term,
+        answer: z.string().trim().min(1).max(300),
+        difficulty: z.enum(levels).default("medium"),
+        source: z.string().trim().max(1000).default("manual"),
+        quote: z.string().trim().max(2000).default(""),
+        image: z.union([id, z.null()]).optional().default(null),
+      })
+      .parse(q.body);
+    const pid = profile(input.profileId);
+    const existing = db.questions(pid);
+    const fw = runQuestionFirewall({
+      question: input.question,
+      answer: input.answer,
+      hasImage: Boolean(input.image),
+      existingQuestions: existing,
+    });
+    if (!fw.passed) {
+      r.status(422).json({ error: fw.reason, stage: fw.stage });
+      return;
+    }
+    const vector = getGeminiApiKey()
+      ? await gemini.embed(input.question).catch(() => [1, 0])
+      : [1, 0];
+    const item: Question = {
+      id: uid(),
+      profileId: pid,
+      question: input.question,
+      answer: input.answer,
+      difficulty: input.difficulty,
+      source: input.source || "manual",
+      quote: input.quote || "",
+      image: input.image ?? null,
+    };
+    db.add(item, vector, getGeminiApiKey() ? "gemini:" + gemini.embedModelName + ":768" : undefined);
+    r.status(201).json(item);
+  });
+
+  api.patch("/questions/:id", async (q, r) => {
+    const input = z
+      .object({
+        profileId: z.string().default("default"),
+        question: term.optional(),
+        answer: z.string().trim().min(1).max(300).optional(),
+        difficulty: z.enum(levels).optional(),
+        source: z.string().trim().max(1000).optional(),
+        quote: z.string().trim().max(2000).optional(),
+        image: z.union([id, z.null()]).optional(),
+      })
+      .parse(q.body);
+    const pid = profile(input.profileId);
+    const current = db.question(q.params.id, pid);
+    if (!current) {
+      r.sendStatus(404);
+      return;
+    }
+    const next: Question = {
+      ...current,
+      question: input.question ?? current.question,
+      answer: input.answer ?? current.answer,
+      difficulty: input.difficulty ?? current.difficulty,
+      source: input.source ?? current.source,
+      quote: input.quote ?? current.quote,
+      image: input.image !== undefined ? input.image : current.image,
+    };
+    const fw = runQuestionFirewall({
+      question: next.question,
+      answer: next.answer,
+      hasImage: Boolean(next.image),
+      existingQuestions: db.questions(pid).filter((item) => item.id !== current.id),
+    });
+    if (!fw.passed) {
+      r.status(422).json({ error: fw.reason, stage: fw.stage });
+      return;
+    }
+    const textChanged = next.question !== current.question;
+    const vector =
+      textChanged && getGeminiApiKey()
+        ? await gemini.embed(next.question).catch(() => undefined)
+        : undefined;
+    const saved = db.updateQuestion(
+      current.id,
+      pid,
+      next,
+      vector,
+      vector ? "gemini:" + gemini.embedModelName + ":768" : undefined,
+    );
+    r.json(saved);
+  });
+
+  api.delete("/questions/:id", (q, r) => {
+    const pid = profile(q.query.profileId || "default");
+    if (!db.deleteQuestion(q.params.id, pid)) {
+      r.sendStatus(404);
+      return;
+    }
+    r.json({ deleted: true, id: q.params.id });
+  });
+
+  api.post("/questions/bulk-delete", (q, r) => {
+    const input = z
+      .object({
+        profileId: z.string().default("default"),
+        ids: z.array(id).min(1).max(1000),
+      })
+      .parse(q.body);
+    const pid = profile(input.profileId);
+    const removed = db.bulkDeleteQuestions(input.ids, pid);
+    r.json({ removed });
+  });
+
+  api.post("/questions/check-quality", (q, r) => {
+    const input = z
+      .object({
+        profileId: z.string().default("default"),
+        question: z.string().trim(),
+        answer: z.string().trim(),
+        hasImage: z.boolean().optional(),
+        excludeId: z.string().optional(),
+      })
+      .parse(q.body);
+    const pid = profile(input.profileId);
+    const existing = db
+      .questions(pid)
+      .filter((row) => row.id !== input.excludeId);
+    r.json(
+      runQuestionFirewall({
+        question: input.question,
+        answer: input.answer,
+        hasImage: input.hasImage,
+        existingQuestions: existing,
+      }),
+    );
+  });
+
   api.post("/questions/from-chat", (q, r) => {
     const profileId = profile(q.body.profileId);
     const text = z.string().min(1).max(250_000).parse(q.body.text);
     r.status(201).json(importChatQuestions(db, profileId, text));
   });
+
   api.post("/questions/:id/image", (q, r) => {
     const pid = profile(q.body.profileId),
       question = db.questions(pid).find((v) => v.id === q.params.id);
@@ -192,19 +397,65 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
       .run(JSON.stringify(question), question.id, pid);
     r.json(question);
   });
+
   const brief = z.object({
     request: term,
-    director: z.enum(["local", "gemini"]).optional(),
+    director: z.enum(["auto", "local", "gemini"]).optional(),
     profileId: z.string().default("default"),
   });
+
   api.post("/interpret", async (q, r) => {
     const input = brief.parse(q.body);
-    r.json(await ai.interpret(input.request));
+    if (input.director === "local") {
+      if (ai) {
+        r.json(await ai.interpret(input.request));
+        return;
+      }
+      if (await probeLoopbackService("OLLAMA_URL", 11434, "/api/tags")) {
+        r.json(await local.interpret(input.request));
+        return;
+      }
+    }
+    if (ai && !getGeminiApiKey()) {
+      r.json(await ai.interpret(input.request));
+      return;
+    }
+    r.json(await gemini.interpret(input.request));
   });
+
   api.post("/assistant", async (q, r) => {
     const input = brief.parse(q.body);
-    r.json(await local.assistant(input.request));
+    if (
+      input.director === "local" &&
+      (await probeLoopbackService("OLLAMA_URL", 11434, "/api/tags"))
+    ) {
+      r.json(await local.assistant(input.request));
+      return;
+    }
+    const pid = profile(input.profileId);
+    const prof = db.profile(pid)!;
+    const profJobs = db
+      .jobs()
+      .filter((j) => j.profileId === pid)
+      .slice(-5)
+      .map((j) => ({
+        id: j.id,
+        topic: j.plan.topic,
+        status: j.status,
+        done: j.done,
+      }));
+    r.json(
+      await gemini.copilot(input.request, {
+        profileName: prof.name,
+        profileRules: prof.rules,
+        questionCount: db.questions(pid).length,
+        assetCount: db.assets().length,
+        activeJobs: profJobs,
+        cloudMode: isCloudEnvironment(),
+      }),
+    );
   });
+
   api.post("/assets/from-search", async (q, r) => {
     const query = term.parse(q.body.query),
       origin = term.parse(q.body.origin);
@@ -220,6 +471,29 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     db.putAsset(meta, await transform(await downloadHit(hit), "original"));
     r.status(201).json(meta);
   });
+
+  api.post("/assets/from-web", async (q, r) => {
+    const input = z
+      .object({
+        imgUrl: term,
+        origin: term,
+        title: z.string().trim().max(300).default("صورة ويب"),
+        rightsConfirmed: z.literal(true),
+      })
+      .parse(q.body);
+    const bytes = await downloadAuthorizedWebImage(input.imgUrl, input.origin);
+    const png = await transform(bytes, "original");
+    const meta: Asset = {
+      id: uid(),
+      origin: input.origin,
+      credit: input.title,
+      license: "user-authorized",
+      rightsStatus: "user-authorized",
+    };
+    db.putAsset(meta, png);
+    r.status(201).json(meta);
+  });
+
   api.get("/search", async (q, r) => {
     const kind = z.enum(["facts", "images", "image-posts"]).parse(q.query.kind),
       t = term.parse(q.query.q);
@@ -230,6 +504,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     };
     r.json(await search[kind](t));
   });
+
   api.get("/jobs/:id/quality", (q, r) => {
     if (!db.job(q.params.id)) {
       r.sendStatus(404);
@@ -237,6 +512,84 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     }
     r.json(db.qualityReport(q.params.id));
   });
+
+  api.get("/jobs/:id/research", (q, r) => {
+    const job = db.job(q.params.id);
+    if (!job) {
+      r.sendStatus(404);
+      return;
+    }
+    const state = db.researchState<ResearchState>(job.id);
+    r.json({
+      jobId: job.id,
+      topic: job.plan.topic,
+      map: state?.map || null,
+      facts: (state?.facts || []).map((f) => ({
+        id: f.id,
+        event: f.event,
+        entity: f.entity,
+        fact: f.fact,
+        answer: f.answer,
+        facet: f.facet,
+        bestLevel: f.bestLevel,
+        importance: f.importance,
+        surprise: f.surprise,
+        audienceReason: f.audienceReason,
+        sourceLabel: f.sourceLabel,
+        sourceUrl: f.source.url,
+        sourceTitle: f.source.title,
+      })),
+      errors: state?.errors || [],
+    });
+  });
+
+  api.get("/audits", (q, r) => {
+    const pid = profile(q.query.profileId || "default");
+    r.json(db.profileAudits(pid));
+  });
+
+  api.get("/export/preview", (q, r) => {
+    const pid = profile(q.query.profileId || "default");
+    const prof = db.profile(pid)!;
+    const jobId = typeof q.query.jobId === "string" && q.query.jobId ? q.query.jobId : undefined;
+    const qs = jobId ? db.acceptedQuestions(jobId) : db.questions(pid);
+    const headers = fields.map((f) => prof.mapping[f] ?? f);
+    const assetMap = new Map(
+      db
+        .assets()
+        .filter((a) => !blockedImageOrigin(a.origin, a.credit))
+        .map((a) => [a.id, a]),
+    );
+    const rows = qs.map((row) => {
+      const asset = row.image ? assetMap.get(row.image) : undefined;
+      return {
+        id: row.id,
+        difficulty: row.difficulty,
+        mapped: Object.fromEntries(
+          fields.map((f, idx) => [
+            headers[idx],
+            f === "image"
+              ? asset
+                ? "images/" + asset.id + ".png"
+                : ""
+              : row[f],
+          ]),
+        ),
+        imageId: asset?.id ?? null,
+        imageLicense: asset?.license ?? null,
+        score: row.quality?.score ?? null,
+        source: row.source,
+      };
+    });
+    r.json({
+      profileName: prof.name,
+      headers,
+      total: rows.length,
+      withImages: rows.filter((x) => x.imageId).length,
+      rows,
+    });
+  });
+
   api.get("/jobs/:id/export/:format", async (q, r) => {
     const job = db.job(q.params.id);
     if (!job) {
@@ -250,7 +603,9 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
       await output(db, job.profileId, format, db.acceptedQuestions(job.id)),
     );
   });
+
   api.get("/jobs", (_, r) => r.json(db.jobs()));
+
   api.post("/jobs", async (q, r) => {
     if (q.body.director !== undefined && q.body.director !== "gemini")
       throw new ProductionUnavailable(
@@ -270,6 +625,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     r.status(202).json(j);
     void worker.drain();
   });
+
   api.post("/jobs/:id/control", (q, r) => {
     const action = z.enum(["pause", "cancel"]).parse(q.body.action);
     const job = db.job(q.params.id);
@@ -295,6 +651,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     db.saveJob(job);
     r.json(job);
   });
+
   api.post("/jobs/:id/retry", async (q, r) => {
     const j = db.job(q.params.id);
     if (!j) {
@@ -329,9 +686,11 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     r.status(202).json(j);
     void worker.drain();
   });
+
   api.get("/assets", (_, r) =>
     r.json(db.assets().filter((a) => !blockedImageOrigin(a.origin, a.credit))),
   );
+
   api.get("/assets/:id", (q, r) => {
     if (!db.canUseAsset(q.params.id)) {
       r.sendStatus(404);
@@ -344,6 +703,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     }
     r.type("png").send(png);
   });
+
   const getAsset = (v: unknown) => {
     const k = id.parse(v),
       png = db.asset(k);
@@ -356,6 +716,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
       throw Error("مصدر الصورة محظور");
     return png;
   };
+
   api.post("/assets", async (q, r) => {
     const input = z
       .object({
@@ -378,6 +739,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     db.putAsset(meta, png);
     r.status(201).json(meta);
   });
+
   api.post("/assets/transform", async (q, r) => {
     const strength = z.number().min(0).max(1).optional().parse(q.body.strength);
     const normalized = z.number().min(0).max(1);
@@ -406,6 +768,7 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     db.putAsset(meta, png);
     r.status(201).json(meta);
   });
+
   api.post("/assets/generate", async (q, r) => {
     const input = z
       .object({
@@ -431,26 +794,40 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
     ]
       .filter(Boolean)
       .join(". ");
-    const png = await transform(
-      await local.image(
-        prompt,
-        input.assetId ? getAsset(input.assetId) : undefined,
-        input.strength,
-      ),
-      "original",
+
+    const comfyReachable = await probeLoopbackService(
+      "COMFY_URL",
+      8188,
+      "/system_stats",
     );
+    const rawImage = comfyReachable
+      ? await local.image(
+          prompt,
+          input.assetId ? getAsset(input.assetId) : undefined,
+          input.strength,
+        )
+      : await gemini.image(
+          prompt,
+          input.assetId ? getAsset(input.assetId) : undefined,
+          input.strength,
+        );
+
+    const png = await transform(rawImage, "original");
     const meta: Asset = {
       id: uid(),
-      credit: source?.credit || "AI illustration",
+      credit: source?.credit || (comfyReachable ? "ComfyUI" : "Gemini Image"),
       origin: source?.origin || "generated",
       license: source?.license || "AI-generated",
       rightsStatus: source?.rightsStatus || (source ? undefined : "generated"),
       originalId: source?.originalId || input.assetId,
-      transformation: source ? input.style || "comfy-edit" : undefined,
+      transformation: source
+        ? input.style || (comfyReachable ? "comfy-edit" : "gemini-edit")
+        : undefined,
     };
     db.putAsset(meta, png);
     r.status(201).json(meta);
   });
+
   api.post("/templates/infer", async (q, r) =>
     r.json(
       await infer(
@@ -459,12 +836,14 @@ export function createApp(db: Store, ai: Provider = new LocalProvider()) {
       ),
     ),
   );
+
   api.get("/export/:format", async (q, r) => {
     const f = z.enum(["json", "csv", "xlsx", "zip"]).parse(q.params.format);
     r.attachment("questions." + f).send(
       await output(db, profile(q.query.profileId), f),
     );
   });
+
   api.use((_, r) => r.status(404).json({ error: "مسار غير موجود" }));
   api.use(
     (

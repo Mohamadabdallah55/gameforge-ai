@@ -1,23 +1,27 @@
 export class LocalConnectionError extends Error {
   constructor() {
     super(
-      "انقطع الاتصال بخادم GameForge المحلي. شغّل npm run local من مجلد المشروع. ستعاود الصفحة الاتصال تلقائيًا.",
+      "انقطع الاتصال بخادم GameForge المحلي. أعد الاتصال بالخادم أو شغّل npm run local من مجلد المشروع.",
     );
     this.name = "LocalConnectionError";
   }
 }
 
-export async function api<T = any>(route: string, body?: unknown): Promise<T> {
-  const r = await fetch(
-    "/api/" + route,
-    body === undefined
-      ? {}
-      : {
-          method: "POST",
+export async function api<T = any>(
+  route: string,
+  body?: unknown,
+  method?: "GET" | "POST" | "PATCH" | "DELETE",
+): Promise<T> {
+  const actualMethod = method || (body === undefined ? "GET" : "POST");
+  const r = await fetch("/api/" + route, {
+    method: actualMethod,
+    ...(body !== undefined
+      ? {
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-        },
-  ).catch(() => {
+        }
+      : {}),
+  }).catch(() => {
     throw new LocalConnectionError();
   });
   if (!r.ok) {

@@ -33,6 +33,9 @@ import {
 import { transform } from "./media";
 import sharp from "sharp";
 import type { StructuredProvider } from "./provider";
+import { runQuestionFirewall } from "./quality-firewall";
+import { isPaidApproved } from "./gemini-client";
+import { probeLoopbackService } from "./environment";
 const draftSchema = z.object({
   question: z.string().trim().min(10).max(400),
   answer: z.string().trim().min(1).max(180),
@@ -419,7 +422,7 @@ export class QualityEngine {
                 png,
                 meta: {
                   id: uid(),
-                  credit: "ComfyUI",
+                  credit: isPaidApproved() ? "Gemini Image" : "ComfyUI",
                   origin: "generated: conceptual illustration",
                   license: "AI-generated",
                   rightsStatus: "generated",
@@ -428,23 +431,35 @@ export class QualityEngine {
             } else {
               if (draft.imagePurpose === "none" || !draft.imageQuery.trim())
                 throw Error("لا يوجد غرض بصري يخدم السؤال");
-              const art =
-                slot.mode === "cartoon" ||
-                slot.mode === "sketch" ||
-                slot.mode === "edited";
-              const image = await realPicture(
-                draft.imageQuery,
+              const hasComfy = await probeLoopbackService(
+                "COMFY_URL",
+                8188,
+                "/system_stats",
+              );
+              const useGenerativeEdit =
+                (slot.mode === "edited" ||
+                  slot.mode === "cartoon" ||
+                  slot.mode === "sketch") &&
+                (hasComfy || isPaidApproved());
+              const localStyle =
                 slot.mode === "silhouette"
                   ? "subject-silhouette"
                   : slot.mode === "bw"
                     ? "bw"
-                    : false,
+                    : slot.mode === "sketch"
+                      ? "sketch"
+                      : slot.mode === "cartoon"
+                        ? "cartoon"
+                        : false;
+              const image = await realPicture(
+                draft.imageQuery,
+                localStyle,
                 context,
                 {
                   review: this.reviewPicture,
                   check,
                   reviewed: () => record("imagesReviewed"),
-                  edit: art
+                  edit: useGenerativeEdit
                     ? (bytes) =>
                         this.ai.image(
                           (slot.mode === "cartoon"
@@ -657,15 +672,23 @@ export class QualityEngine {
       },
       draftSchema,
     );
+    const firewall = runQuestionFirewall({
+      question: draft.question,
+      answer: draft.answer,
+      quote: fact.quote,
+      sourceText: fact.source.text,
+      hasImage: picture,
+    });
     if (
+      !firewall.passed ||
       (!picture && draft.imagePurpose === "recognition") ||
-      reveals(draft.question, draft.answer) ||
       normalize(fact.answer) !== normalize(draft.answer)
     )
       return {
         reject: {
-          stage: "evidence",
+          stage: firewall.stage || "evidence",
           reason:
+            firewall.reason ||
             "الإجابة تغيرت أو ظهرت في السؤال، أو يتطلب السؤال صورة غير متاحة",
           candidate: draft.question,
         },

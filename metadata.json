@@ -1,0 +1,8 @@
+{
+  "name": "GameForge AI — مصنع محتوى المسابقات",
+  "description": "منصة عربية متكاملة لإنتاج وتدقيق أسئلة وصور المسابقات بالذكاء الاصطناعي والبحث العميق مع فحص الجودة البصري والنصي والتصدير متعدد الصيغ.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

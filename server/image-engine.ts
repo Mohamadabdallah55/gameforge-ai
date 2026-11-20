@@ -48,13 +48,19 @@ export async function realPicture(
 ) {
   if (!options.review) {
     const model = visionModel();
-    const { models } = await ollama("/api/tags");
-    if (
-      !models.some((m: { name: string }) =>
-        [model, model + ":latest"].includes(m.name),
+    try {
+      const { models } = await ollama("/api/tags");
+      if (
+        !models.some((m: { name: string }) =>
+          [model, model + ":latest"].includes(m.name),
+        )
       )
-    )
-      throw Error("لم يُثبّت نموذج الرؤية " + model + "؛ بقي السؤال دون صورة");
+        throw Error("لم يُثبّت نموذج الرؤية " + model + "؛ بقي السؤال دون صورة");
+    } catch {
+      throw Error(
+        "محرك تحليل الصور (Gemini Vision أو Ollama Vision) غير متصل حاليًا.",
+      );
+    }
   }
   const target = context || {
     question: "",

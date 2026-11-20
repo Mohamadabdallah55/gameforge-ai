@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+
 test("Elite production blocks unqualified engines and retains prior import", async ({
   page,
   request,
@@ -101,6 +102,7 @@ test("Arabic UI imports a profile, uploads and processes an image, exports the l
   await page.getByRole("link", { name: "تنزيل ZIP" }).click();
   expect((await download).suggestedFilename()).toBe("questions.zip");
 });
+
 test("authorized video frame becomes a PNG", async ({ page }) => {
   await page.goto("/");
   const bytes = await page.evaluate(async () => {
@@ -158,4 +160,47 @@ test("connection banner clears when the server returns and preserves the draft",
   await expect(page.getByRole("alert")).toBeHidden();
   await expect(request).toHaveValue("اعمل عشر اسئلة عن كاس العالم ٢٠٢٦");
   await expect(page.getByRole("button", { name: "تحليل الطلب" })).toBeEnabled();
+});
+
+test("manual CRUD + Quality Firewall check, Export Preview, and Cloud/Local Engines separation work in UI", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  // 1. Quality tab: Firewall tester rejects trivial self-answering question
+  await page.getByRole("button", { name: "الجودة", exact: true }).click();
+  await page
+    .getByLabel("نص السؤال للاختبار")
+    .fill("ما هي السنة التي أقيمت فيها كأس العالم 2026؟");
+  await page.getByLabel("الإجابة").fill("2026");
+  await page.getByRole("button", { name: "فحص السؤال الآن" }).click();
+  await expect(page.getByText(/مرفوض \(firewall-leak\)/)).toBeVisible();
+
+  // 2. Library tab: Create valid manual question, inspect Export Preview, then delete
+  await page.getByRole("button", { name: "المكتبة", exact: true }).click();
+  await page.getByRole("button", { name: "إضافة سؤال يدويًا" }).click();
+  await page
+    .getByLabel("نص السؤال")
+    .fill("أي نادٍ حقق عودة إسطنبول التاريخية في نهائي دوري الأبطال؟");
+  await page.getByLabel("الإجابة الدقيقة").fill("ليفربول");
+  await page.getByRole("button", { name: "فحص فايروول الجودة" }).click();
+  await expect(page.getByText(/اجتاز السؤال فحص فايروول الجودة/)).toBeVisible();
+  await page.getByRole("button", { name: "إضافة السؤال" }).click();
+  await expect(page.getByRole("status")).toContainText("أُضيف السؤال");
+  await expect(
+    page.getByText("أي نادٍ حقق عودة إسطنبول التاريخية في نهائي دوري الأبطال؟"),
+  ).toBeVisible();
+
+  // 3. Export Preview tab shows mapped rows
+  await page.getByRole("button", { name: "التصدير", exact: true }).click();
+  await expect(page.getByText("ليفربول")).toBeVisible();
+
+  // 4. AI Engines tab separates Cloud and Local engines cleanly
+  await page.getByRole("button", { name: "AI Engines", exact: true }).click();
+  await expect(
+    page.getByText("المحركات السحابية الفعّالة داخل Google AI Studio"),
+  ).toBeVisible();
+  await expect(
+    page.getByText("المحركات المحلية (محطة Mac / التشغيل المحلي فقط)"),
+  ).toBeVisible();
 });

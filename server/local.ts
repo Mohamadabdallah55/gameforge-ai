@@ -4,14 +4,14 @@ import { visualSchema } from "../shared/quality";
 import type { Provider } from "../shared/contracts";
 import { Gemini, StructuredProvider } from "./provider";
 import { diffuse } from "./comfy";
+import { getGeminiApiKey, resolveEmbedModel } from "./gemini-client";
 
 export const textModel = () => process.env.OLLAMA_TEXT_MODEL || "qwen3:8b";
 export const embedModel = () => process.env.OLLAMA_EMBED_MODEL || "bge-m3";
 export const embeddingSpace = () =>
-  process.env.AI_PROVIDER === "gemini"
-    ? "gemini:" +
-      (process.env.GEMINI_EMBED_MODEL || "gemini-embedding-001") +
-      ":768"
+  process.env.AI_PROVIDER === "gemini" ||
+  (process.env.AI_PROVIDER !== "local" && Boolean(getGeminiApiKey()))
+    ? "gemini:" + resolveEmbedModel() + ":768"
     : "ollama:" + embedModel();
 
 export function endpoint(key: string, port: number) {
@@ -59,10 +59,11 @@ export function exclusive<T>(
   );
   return operation;
 }
+
 export async function ollama(path: string, body?: unknown) {
   try {
     const r = await localHttp(endpoint("OLLAMA_URL", 11434) + path, {
-      timeout: body ? 240000 : 3000,
+      timeout: body ? 240000 : 1200,
       body: body ? JSON.stringify(body) : undefined,
       headers: body ? { "content-type": "application/json" } : undefined,
     });
@@ -73,6 +74,7 @@ export async function ollama(path: string, body?: unknown) {
     throw Error("Ollama: " + (e as Error).message);
   }
 }
+
 export class LocalProvider extends StructuredProvider {
   protected async json<T>(
     instruction: string,
@@ -126,19 +128,47 @@ export class LocalProvider extends StructuredProvider {
     return exclusive("ComfyUI", () => diffuse(prompt, input, strength));
   }
 }
+
 export function provider(): Provider {
-  return process.env.AI_PROVIDER === "gemini"
+  return process.env.AI_PROVIDER === "gemini" ||
+    (process.env.AI_PROVIDER !== "local" && Boolean(getGeminiApiKey()))
     ? new Gemini()
     : new LocalProvider();
 }
+
 export function assist(request: string) {
-  return new LocalProvider().assistant(request);
+  const engine =
+    process.env.AI_PROVIDER === "gemini" ||
+    (process.env.AI_PROVIDER !== "local" && Boolean(getGeminiApiKey()))
+      ? new Gemini()
+      : new LocalProvider();
+  return engine.assistant(request);
 }
+
+let cloudTranslator: ((q: string) => Promise<string>) | undefined;
+export function registerCloudTranslator(fn: (q: string) => Promise<string>) {
+  cloudTranslator = fn;
+}
+
 const translations = new Map<string, string>();
 export async function translateQuery(query: string) {
   if (!/[\u0600-\u06ff]/.test(query)) return query;
   const cached = translations.get(query);
   if (cached) return cached;
+
+  // Prefer cloud Gemini translator in AI Studio when configured and not forced local
+  if (cloudTranslator && process.env.AI_PROVIDER !== "local" && getGeminiApiKey()) {
+    try {
+      const translated = (await cloudTranslator(query)).trim().slice(0, 240) || query;
+      if (translations.size >= 512)
+        translations.delete(translations.keys().next().value!);
+      translations.set(query, translated);
+      return translated;
+    } catch {
+      // fall through cleanly
+    }
+  }
+
   return exclusive("Ollama", async () => {
     const r = await ollama("/api/chat", {
       model: textModel(),
@@ -162,8 +192,10 @@ export async function translateQuery(query: string) {
     return translated;
   });
 }
+
 export const visionModel = () =>
   process.env.OLLAMA_VISION_MODEL || "qwen3-vl:2b-instruct";
+
 export async function assessPixels(
   context: import("./image-engine").ImageContext,
   sourceContext: string,

@@ -11,7 +11,7 @@ import {
 } from "../shared/contracts";
 import { information } from "./search";
 import { Store, uid, normalize } from "./store";
-import { realPicture } from "./image-engine";
+import { realPicture, type PictureReviewer } from "./image-engine";
 import { transform } from "./media";
 import {
   checkJobControl,
@@ -29,6 +29,7 @@ export class Worker {
     private quality?: QualityEngine,
     private chatgptQuality?: (job: Job) => QualityEngine,
     private production?: (job: Job) => Promise<void>,
+    private reviewPicture?: PictureReviewer,
   ) {}
   finishing(id: string) {
     return this.activeId === id;
@@ -156,12 +157,17 @@ export class Worker {
         let image = null;
         if (!q.image || !this.db.canUseAsset(q.image)) {
           try {
-            image = await realPicture(q.quality?.event || q.answer, false, {
-              question: q.question,
-              answer: q.answer,
-              event: q.quality?.event || q.answer,
-              recognition: false,
-            });
+            image = await realPicture(
+              q.quality?.event || q.answer,
+              false,
+              {
+                question: q.question,
+                answer: q.answer,
+                event: q.quality?.event || q.answer,
+                recognition: false,
+              },
+              this.reviewPicture ? { review: this.reviewPicture } : undefined,
+            );
           } catch (e) {
             j.imageFailures = (j.imageFailures || 0) + 1;
             j.error = String((e as Error).message);
