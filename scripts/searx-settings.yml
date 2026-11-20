@@ -1,0 +1,20 @@
+use_default_settings: true
+general:
+  instance_name: GameForge Search
+  contact_url: "https://github.com/Mohamadabdallah55/gameforge-ai/issues"
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  secret_key: "gameforge-local-only"
+  limiter: false
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+outgoing:
+  request_timeout: 4.0
+engines:
+  - name: wikipedia
+    display_type: [infobox, list]
+    timeout: 8.0

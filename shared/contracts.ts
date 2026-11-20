@@ -1,30 +1,64 @@
+import type { QuestionQuality } from "./quality";
 import { z } from "zod";
-
 export const levels = ["easy", "medium", "hard"] as const;
 export type Level = (typeof levels)[number];
-
-const count = z.number().int().min(0).max(500);
-
-export const searchSources = ["auto", "google", "wikipedia", "tavily"] as const;
-export type SearchSource = (typeof searchSources)[number];
-
-export const imageStrategies = ["real_then_ai", "real_only", "ai_only"] as const;
-export type ImageStrategy = (typeof imageStrategies)[number];
-
+export const difficultyPoints = { easy: 200, medium: 400, hard: 600 } as const;
+const count = z.number().int().min(0).max(10000);
+export const imageModes = [
+  "real",
+  "generated",
+  "edited",
+  "sketch",
+  "cartoon",
+  "silhouette",
+  "bw",
+  "auto",
+  "none",
+] as const;
+export const imageMixModes = [
+  "real",
+  "generated",
+  "sketch",
+  "cartoon",
+  "silhouette",
+  "bw",
+  "auto",
+] as const;
+export const artModes = ["pencil", "cartoon", "render3d", "eventArt"] as const;
+const imageMix = z.partialRecord(
+  z.enum(imageMixModes),
+  z.object({
+    count: count.optional(),
+    percent: z.number().min(0).max(100).optional(),
+  }),
+);
 export const planSchema = z
   .object({
     topic: z.string().trim().min(1).max(1000),
     easy: count,
     medium: count,
     hard: count,
+    eliteQuality: z.boolean().optional(),
+    audienceRegion: z.enum(["jordan", "arab", "mixed"]).optional(),
+    brief: z.string().trim().max(2000).optional(),
+    audience: z.string().trim().max(240).optional(),
+    imageMode: z.enum(imageModes).optional(),
     imagePercent: z.number().int().min(0).max(100),
-    searchSource: z.enum(searchSources).optional(),
-    imageStrategy: z.enum(imageStrategies).optional(),
+    imageMix: imageMix.optional(),
   })
-  .refine((p) => p.easy + p.medium + p.hard > 0, "يلزم سؤال واحد على الأقل");
-
+  .refine((p) => p.easy + p.medium + p.hard > 0, "يلزم سؤال واحد على الأقل")
+  .refine((p) => {
+    const total = p.easy + p.medium + p.hard;
+    return (
+      Object.values(p.imageMix || {}).reduce(
+        (used, part) =>
+          used +
+          (part.count ?? Math.round((total * (part.percent ?? 0)) / 100)),
+        0,
+      ) <= total
+    );
+  }, "مجموع الصور المطلوبة أكبر من عدد الأسئلة");
 export type Plan = z.infer<typeof planSchema>;
-
 export const fields = [
   "question",
   "answer",
@@ -32,7 +66,6 @@ export const fields = [
   "image",
   "source",
 ] as const;
-
 export const profileSchema = z
   .object({
     name: z.string().trim().min(1).max(100),
@@ -45,24 +78,21 @@ export const profileSchema = z
     (p) => new Set(fields.map((k) => p.mapping[k] ?? k)).size === fields.length,
     "أسماء الحقول متكررة",
   );
-
 export type Profile = z.infer<typeof profileSchema>;
-
 export interface Evidence {
   title: string;
   url: string;
   text: string;
 }
-
 export interface Asset {
   id: string;
   origin: string;
   credit: string;
   license: string;
+  rightsStatus?: "reusable" | "user-authorized" | "generated";
+  originalId?: string;
+  transformation?: string;
 }
-
-export type AuditStatus = "pending" | "verified" | "flagged";
-
 export interface Question {
   id: string;
   profileId: string;
@@ -72,11 +102,8 @@ export interface Question {
   source: string;
   quote: string;
   image: string | null;
-  auditStatus?: AuditStatus;
-  auditNote?: string;
-  updatedAt?: string;
+  quality?: QuestionQuality;
 }
-
 export interface Candidate {
   question: string;
   answer: string;
@@ -84,14 +111,6 @@ export interface Candidate {
   quote: string;
   imageQuery: string;
 }
-
-export interface ImageGenerateOptions {
-  model?: "gemini-3.1-flash-lite-image" | "gemini-nano-banana-2.1";
-  aspectRatio?: "1:1" | "3:4" | "4:3" | "9:16" | "16:9";
-  imageSize?: "1K" | "2K" | "4K";
-  useSearch?: boolean;
-}
-
 export interface Provider {
   interpret(request: string): Promise<Plan>;
   draft(
@@ -107,21 +126,36 @@ export interface Provider {
     source: Evidence,
   ): Promise<boolean>;
   embed(text: string): Promise<number[]>;
-  image(
-    prompt: string,
-    input?: Buffer,
-    options?: ImageGenerateOptions,
-  ): Promise<Buffer>;
+  image(prompt: string, input?: Buffer, strength?: number): Promise<Buffer>;
 }
-
 export function slots(plan: Plan) {
   const sequence = levels.flatMap((k) => Array<Level>(plan[k]).fill(k));
-  const n = sequence.length,
-    target = Math.round((n * plan.imagePercent) / 100);
-  return sequence.map((level, i) => ({
-    level,
-    image: Math.floor(((i + 1) * target) / n) > Math.floor((i * target) / n),
-  }));
+  const n = sequence.length;
+  const allocation: NonNullable<Plan["imageMode"]>[] = plan.imageMix
+    ? imageMixModes
+        .flatMap((mode) => {
+          const part = plan.imageMix![mode];
+          const amount =
+            part?.count ?? Math.round((n * (part?.percent ?? 0)) / 100);
+          return Array.from({ length: amount }, (_, i) => ({
+            mode,
+            order: (i + 0.5) / amount,
+          }));
+        })
+        .sort((a, b) => a.order - b.order)
+        .map((item) => item.mode)
+    : Array(
+        Math.round(
+          (n * (plan.imageMode === "none" ? 0 : plan.imagePercent)) / 100,
+        ),
+      ).fill(plan.imageMode || "auto");
+  const target = allocation.length;
+  let next = 0;
+  return sequence.map((level, i) => {
+    const image =
+      Math.floor(((i + 1) * target) / n) > Math.floor((i * target) / n);
+    return { level, image, mode: image ? allocation[next++] : undefined };
+  });
 }
 
 export interface Job {
@@ -129,42 +163,24 @@ export interface Job {
   profileId: string;
   plan: Plan;
   done: number;
-  status: "queued" | "running" | "paused" | "failed" | "complete";
+  status:
+    | "queued"
+    | "running"
+    | "failed"
+    | "complete"
+    | "partial"
+    | "paused"
+    | "cancelled";
   error: string;
-  stage?: string;
-  rejected?: number;
-}
-
-export interface AuditIssue {
-  questionId: string;
-  type: "duplicate" | "citation" | "image" | "fact";
-  severity: "high" | "medium";
-  message: string;
-  relatedId?: string;
-  similarity?: number;
-}
-
-export interface AuditReport {
-  profileId: string;
-  checkedAt: string;
-  totalQuestions: number;
-  verifiedCount: number;
-  flaggedCount: number;
-  duplicatePairs: number;
-  issues: AuditIssue[];
-}
-
-export interface AssistantActionLog {
-  tool: string;
-  summary: string;
-  ok: boolean;
-}
-
-export interface AssistantMessage {
-  id: string;
-  profileId: string;
-  role: "user" | "assistant";
-  content: string;
-  actions?: AssistantActionLog[];
-  createdAt: string;
+  imageFailures?: number;
+  imageQuestionIds?: string[];
+  startedAt?: number;
+  qualityVersion?: 1;
+  cursor?: number;
+  qualityStage?: string;
+  qualityRetries?: number;
+  chatgpt?: { account: string; model: string };
+  pauseCode?: string;
+  production?: { provider: "gemini"; model: string };
+  metrics?: { sourcesChecked: number; imagesReviewed: number };
 }

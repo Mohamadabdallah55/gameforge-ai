@@ -9,13 +9,13 @@ if (process.argv.includes("--production")) {
 } else {
   const { createServer } = await import("vite");
   const vite = await createServer({
-    server: { middlewareMode: true, hmr: false, allowedHosts: true },
+    server: { middlewareMode: true, hmr: false },
     appType: "spa",
   });
   app.use(vite.middlewares);
 }
 const port = Number(process.env.PORT || 3000);
-app.listen(port, process.env.HOST || "0.0.0.0", () => {
+app.listen(port, process.env.HOST || "127.0.0.1", () => {
   console.log("GameForge AI port " + port);
   void worker.drain();
 });

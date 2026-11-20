@@ -1,63 +1,141 @@
-import type { Evidence, SearchSource } from "../shared/contracts";
-import { resolveGeminiKey } from "./provider";
-
-const USER_AGENT =
-  process.env.WIKI_USER_AGENT ||
-  "GameForgeAI/1.0 (https://github.com/Mohamadabdallah55/gameforge-ai; support@gameforge.local)";
-
-const headers = () => ({
-  "User-Agent": USER_AGENT,
-  Accept: "application/json,image/*;q=0.9,*/*;q=0.8",
-});
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+import { publisherLicense } from "./licensed-publisher";
+import { blockedImageOrigin } from "./image-policy";
+import { localHttp } from "./local-http";
+import { normalize, type Store } from "./store";
+import { endpoint, translateQuery } from "./local";
+import { publicImage, publicArticle } from "./net-image";
+let database: Store | undefined;
+export function persistSearch(db: Store) {
+  database = db;
 }
-
-const hostNextSlot = new Map<string, number>();
-const hostCooldownUntil = new Map<string, number>();
-
-async function paceHost(hostname: string, minGapMs = 350) {
-  const now = Date.now();
-  const cooldown = hostCooldownUntil.get(hostname) ?? 0;
-  if (cooldown > now) {
-    const wait = cooldown - now;
-    if (wait > 6000) {
-      throw new Error(
-        `الخادم ${hostname} يطلب الانتظار ${Math.ceil(wait / 1000)} ثوانٍ بسبب حد الطلبات (429)`,
+const cooldown = new Map<string, number>();
+const inFlight = new Map<string, Promise<any>>();
+async function cached(url: URL) {
+  const key = url.toString();
+  const existing = inFlight.get(key);
+  if (existing) return existing;
+  const hit = database?.db
+    .prepare("SELECT body FROM search_cache WHERE key=? AND expires>?")
+    .get(key, Date.now());
+  if (hit) return JSON.parse(String(hit.body));
+  if ((cooldown.get(url.host) || 0) > Date.now())
+    throw Error(url.host + " rate limited");
+  const run = (async () => {
+    const r =
+      url.protocol === "http:"
+        ? await localHttp(url, { headers: headers(), timeout: 12000 })
+        : await fetch(url, {
+            headers: headers(),
+            signal: AbortSignal.timeout(12000),
+            redirect: "error",
+          });
+    if (r.status === 429) {
+      const retry = r.headers.get("retry-after") || "60";
+      cooldown.set(
+        url.host,
+        Date.now() +
+          Math.max(
+            60000,
+            Number.isFinite(Number(retry))
+              ? Number(retry) * 1000
+              : (Date.parse(retry) || 0) - Date.now(),
+          ),
       );
     }
-    await sleep(wait);
+    if (!r.ok) throw Error(url.host + " HTTP " + r.status);
+    const data = await r.json();
+    if (!data.error)
+      database?.db
+        .prepare("INSERT OR REPLACE INTO search_cache VALUES(?,?,?)")
+        .run(key, JSON.stringify(data), Date.now() + 86400000);
+    return data;
+  })();
+  inFlight.set(key, run);
+  try {
+    return await run;
+  } finally {
+    inFlight.delete(key);
   }
-  const nextAllowed = hostNextSlot.get(hostname) ?? 0;
-  if (nextAllowed > Date.now()) {
-    await sleep(nextAllowed - Date.now());
-  }
-  hostNextSlot.set(hostname, Date.now() + minGapMs);
 }
-
-function isSafePublicUrl(urlStr: string): URL {
-  const u = new URL(urlStr);
-  if (u.protocol !== "https:") {
-    throw new Error("يُسمح فقط بروابط HTTPS");
-  }
-  const host = u.hostname.toLowerCase();
-  if (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host === "::1" ||
-    host.endsWith(".local") ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
-  ) {
-    throw new Error("عنوان شبكة غير مسموح");
-  }
-  return u;
+async function searxResponse(
+  q: string,
+  images: boolean,
+  language?: string,
+  engines?: string,
+) {
+  const u = new URL(endpoint("SEARXNG_URL", 8888) + "/search");
+  u.search = new URLSearchParams({
+    q,
+    format: "json",
+    categories: images ? "images" : "general",
+    ...(language ? { language } : {}),
+    ...(engines ? { engines } : {}),
+  }).toString();
+  return cached(u);
 }
-
-async function queryWiki(host: string, params: Record<string, string>) {
+async function searx(q: string, images: boolean, language?: string) {
+  return (await searxResponse(q, images, language)).results || [];
+}
+export const googleImagesStatus: {
+  checkedAt?: number;
+  count?: number;
+  error?: string;
+} = {};
+export function sourceHost(url: string) {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+export async function searchWeb(
+  q: string,
+  language: string,
+): Promise<Evidence[]> {
+  const url = new URL(endpoint("SEARXNG_URL", 8888) + "/search");
+  url.search = new URLSearchParams({
+    q,
+    format: "json",
+    categories: "general",
+    language,
+  }).toString();
+  const r = await cached(url);
+  return (r.results || [])
+    .filter(
+      (x: any) =>
+        typeof x.url === "string" &&
+        x.url.startsWith("https://") &&
+        sourceHost(x.url),
+    )
+    .slice(0, 18)
+    .map((x: any) => ({
+      title: String(x.title || "").slice(0, 230),
+      url: x.url,
+      text: String(x.content || "").slice(0, 400),
+    }));
+}
+export async function articleBytes(url: string): Promise<string> {
+  const key = "article:" + url;
+  const hit = database?.db
+    .prepare("SELECT body FROM search_cache WHERE key=? AND expires>?")
+    .get(key, Date.now());
+  if (hit) return String(hit.body);
+  const html = (await publicArticle(url, headers()["User-Agent"])).toString(
+    "utf8",
+  );
+  // Keep the cache compact enough for a local library.
+  if (Buffer.byteLength(html) < 100000)
+    database?.db
+      .prepare("INSERT OR REPLACE INTO search_cache VALUES(?,?,?)")
+      .run(key, html, Date.now() + 86400000);
+  return html;
+}
+import type { Evidence } from "../shared/contracts";
+const headers = () => ({
+  "User-Agent":
+    process.env.WIKI_USER_AGENT || "GameForgeAI/0.1 (quiz research)",
+});
+async function query(host: string, params: Record<string, string>) {
   const url = new URL("https://" + host + "/w/api.php");
   url.search = new URLSearchParams({
     action: "query",
@@ -65,22 +143,52 @@ async function queryWiki(host: string, params: Record<string, string>) {
     formatversion: "2",
     ...params,
   }).toString();
-  await paceHost(host, 250);
-  const r = await fetch(url, {
-    headers: headers(),
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!r.ok) throw new Error("Wikimedia HTTP " + r.status);
-  const data = await r.json();
+  const data = await cached(url);
   if (data.error) throw new Error("Wikimedia " + data.error.code);
   return data.query?.pages ?? [];
 }
-
-async function wikipediaEvidence(term: string): Promise<Evidence[]> {
-  for (const lang of ["ar", "en"]) {
-    const pages = await queryWiki(lang + ".wikipedia.org", {
+export async function information(
+  term: string,
+  allowExternal = true,
+): Promise<Evidence[]> {
+  const key = process.env.TAVILY_API_KEY;
+  if (allowExternal && key && process.env.EXTERNAL_SEARCH === "tavily") {
+    const r = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + key,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query: term,
+        search_depth: "basic",
+        max_results: 5,
+        include_answer: false,
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+    if (!r.ok) throw new Error("Tavily HTTP " + r.status);
+    const data = await r.json();
+    const evidence: Evidence[] = data.results
+      .filter(
+        (v: { url: string; content: string }) =>
+          /^https?:\/\//i.test(v.url) && v.content?.trim(),
+      )
+      .map((v: { title: string; url: string; content: string }) => ({
+        title: v.title,
+        url: v.url,
+        text: v.content.slice(0, 5000),
+      }));
+    if (evidence.length) return evidence;
+  }
+  const english = await translateQuery(term).catch(() => term);
+  const articles: Evidence[] = [];
+  for (const lang of /[\u0600-\u06ff]/.test(term)
+    ? ["ar", "en"]
+    : ["en", "ar"]) {
+    const pages = await query(lang + ".wikipedia.org", {
       generator: "search",
-      gsrsearch: term,
+      gsrsearch: lang === "en" ? english : term,
       gsrlimit: "5",
       exintro: "1",
       prop: "extracts|info",
@@ -88,282 +196,312 @@ async function wikipediaEvidence(term: string): Promise<Evidence[]> {
       exchars: "5000",
       exlimit: "5",
       inprop: "url",
-    });
+    }).catch(() => []);
     const evidence = pages
+      .sort(
+        (a: { index?: number }, b: { index?: number }) =>
+          (a.index ?? 100) - (b.index ?? 100),
+      )
       .filter((p: { extract?: string }) => p.extract?.trim())
       .map((p: { title: string; fullurl: string; extract: string }) => ({
         title: p.title,
         url: p.fullurl,
         text: p.extract,
       }));
-    if (evidence.length) return evidence;
+    articles.push(...evidence);
   }
-  return [];
+  const web = await searx(english, false).catch(() => []);
+  return [
+    ...articles,
+    ...web
+      .filter((r: any) => r.content && /^https?:\/\//.test(r.url))
+      .slice(0, 4)
+      .map((r: any) => ({ title: r.title, url: r.url, text: r.content })),
+  ];
 }
-
-async function tavilyEvidence(term: string): Promise<Evidence[]> {
-  const key = process.env.TAVILY_API_KEY;
-  if (!key) return [];
-  const r = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: {
-      Authorization: "Bearer " + key,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: term,
-      search_depth: "basic",
-      max_results: 5,
-      include_answer: false,
-    }),
-    signal: AbortSignal.timeout(25000),
-  });
-  if (!r.ok) throw new Error("Tavily HTTP " + r.status);
-  const data = await r.json();
-  return (data.results ?? [])
-    .filter(
-      (v: { url: string; content: string }) =>
-        /^https?:\/\//i.test(v.url) && v.content?.trim(),
-    )
-    .map((v: { title: string; url: string; content: string }) => ({
-      title: v.title,
-      url: v.url,
-      text: v.content.slice(0, 5000),
-    }));
-}
-
-export async function information(
-  term: string,
-  source: SearchSource = "auto",
-  ai?: {
-    searchEvidence?: (q: string) => Promise<Evidence[]>;
-    isGoogleSearchThrottled?: () => boolean;
-  },
-): Promise<Evidence[]> {
-  const merged: Evidence[] = [];
-  const seen = new Set<string>();
-  const pushAll = (items: Evidence[]) => {
-    for (const item of items) {
-      if (!seen.has(item.url)) {
-        seen.add(item.url);
-        merged.push(item);
-      }
-    }
-  };
-
-  if (source === "tavily") {
-    return tavilyEvidence(term);
-  }
-  if (source === "wikipedia") {
-    return wikipediaEvidence(term);
-  }
-  if (source === "google") {
-    if (!ai?.searchEvidence) {
-      throw new Error("بحث Google غير مهيأ");
-    }
-    return ai.searchEvidence(term);
-  }
-
-  // auto: Tavily (if configured) + Google Search Grounding (if Gemini configured) + Wikipedia fallback/supplement
-  if (process.env.TAVILY_API_KEY) {
-    try {
-      pushAll(await tavilyEvidence(term));
-    } catch {
-      // fall through
-    }
-  }
-  if (
-    resolveGeminiKey() &&
-    ai?.searchEvidence &&
-    !ai.isGoogleSearchThrottled?.()
-  ) {
-    try {
-      pushAll(await ai.searchEvidence(term));
-    } catch {
-      // fall back to Wikipedia if Gemini search fails
-    }
-  }
-  if (merged.length < 2) {
-    try {
-      pushAll(await wikipediaEvidence(term));
-    } catch {
-      // ignore if Google/Tavily already returned results
-    }
-  }
-  return merged;
-}
-
 export interface ImageHit {
   title: string;
   url: string;
-  fallbackUrl?: string;
   origin: string;
   credit: string;
   license: string;
-  provider?: "wikimedia" | "openverse";
+  original?: string;
+  description?: string;
+  provenance?: string;
+  publisherCaption?: string;
 }
-
-async function wikimediaPictures(term: string): Promise<ImageHit[]> {
-  const pages = await queryWiki("commons.wikimedia.org", {
-    generator: "search",
-    gsrsearch: term + " filetype:bitmap",
-    gsrnamespace: "6",
-    gsrlimit: "8",
-    prop: "imageinfo",
-    iiprop: "url|extmetadata",
-    iiurlwidth: "800",
-  });
-  return pages.flatMap(
-    (p: { title: string; imageinfo?: Record<string, any>[] }) => {
-      const i = p.imageinfo?.[0],
-        m = i?.extmetadata;
-      const primary = i?.thumburl || i?.url;
-      if (!primary || !m?.LicenseShortName?.value) return [];
-      return [
-        {
-          title: p.title.replace(/^File:/i, ""),
-          url: primary,
-          fallbackUrl: i?.url && i.url !== primary ? i.url : undefined,
-          origin: i.descriptionurl,
-          credit:
-            String(m.Artist?.value || "Wikimedia Commons")
-              .replace(/<[^>]+>/g, "")
-              .trim() || "Wikimedia Commons",
-          license: String(m.LicenseShortName.value),
-          provider: "wikimedia" as const,
-        },
-      ];
-    },
+function reusable(license: string) {
+  return /^(CC[ -](BY(?:[ -]SA)?|0)(?= |$)|Public domain|PDM|by(?:-sa)?(?= |$)|cc0$)/i.test(
+    license,
   );
 }
-
-async function openversePictures(term: string): Promise<ImageHit[]> {
+async function openverse(term: string): Promise<ImageHit[]> {
   const url = new URL("https://api.openverse.org/v1/images/");
-  url.searchParams.set("q", term);
-  url.searchParams.set("page_size", "8");
-  url.searchParams.set("mature", "false");
-  await paceHost("api.openverse.org", 250);
-  const r = await fetch(url, {
-    headers: headers(),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!r.ok) return [];
-  const data = (await r.json()) as {
-    results?: Array<{
-      title?: string;
-      url?: string;
-      thumbnail?: string;
-      foreign_landing_url?: string;
-      creator?: string;
-      license?: string;
-      license_version?: string;
-    }>;
-  };
-  return (data.results ?? []).flatMap((item) => {
-    const primary = item.thumbnail || item.url;
-    const origin = item.foreign_landing_url || item.url;
-    if (!primary || !origin || !/^https:\/\//i.test(primary)) return [];
+  url.search = new URLSearchParams({
+    q: term.slice(0, 200),
+    page_size: "12",
+    excluded_source: "wikimedia",
+    license: "cc0,pdm,by,by-sa",
+  }).toString();
+  return (await cached(url)).results.flatMap((r: any) =>
+    r.url &&
+    r.foreign_landing_url &&
+    r.license &&
+    !blockedImageOrigin(
+      r.source,
+      r.provider,
+      r.url,
+      r.thumbnail,
+      r.foreign_landing_url,
+      r.attribution,
+      r.creator_url,
+    )
+      ? [
+          {
+            title: r.title || "",
+            url: r.thumbnail || r.url,
+            original: r.url,
+            origin: r.foreign_landing_url,
+            credit: r.creator || "Openverse",
+            license:
+              r.license +
+              (r.license_version && r.license.startsWith("by")
+                ? " " + r.license_version
+                : ""),
+            description: [r.description, r.attribution]
+              .filter(Boolean)
+              .join(" ")
+              .slice(0, 600),
+            provenance: [r.source, r.provider].filter(Boolean).join(" "),
+          },
+        ]
+      : [],
+  );
+}
+async function nasaArchive(q: string): Promise<ImageHit[]> {
+  const frame = q.match(/\bAS\d{2}-\d{1,3}-\d{4,5}\b/i)?.[0].toLowerCase();
+  if (!frame && !/\b(?:apollo|nasa|buzz aldrin|neil armstrong)\b/i.test(q))
+    return [];
+  const url = new URL("https://images-api.nasa.gov/search");
+  url.search = new URLSearchParams({
+    ...(frame ? { nasa_id: frame } : { q: q.slice(0, 160) }),
+    media_type: "image",
+    page_size: "20",
+  }).toString();
+  const data = await cached(url);
+  return (data.collection?.items || []).flatMap((item: any) => {
+    const meta = item.data?.[0];
+    const id = String(meta?.nasa_id || "");
+    const archive = id.match(/^AS(\d{2})-(\d{1,3})-(\d{4,5})$/i);
+    const caption = String(meta?.description || "");
+    if (
+      !archive ||
+      caption.length < 70 ||
+      /copyright|third.party|creative commons/i.test(caption) ||
+      blockedImageOrigin(caption)
+    )
+      return [];
+    const files = (item.links || []).filter(
+      (link: any) =>
+        sourceHost(link.href) === "images-assets.nasa.gov" &&
+        /\.(jpg|jpeg|png)$/i.test(link.href),
+    );
+    const original = files.sort(
+      (a: any, b: any) => (b.width || 0) - (a.width || 0),
+    )[0]?.href;
+    if (!original) return [];
+    const [, mission, roll, photo] = archive;
+    const origin =
+      "https://eol.jsc.nasa.gov/SearchPhotos/photo.pl?" +
+      new URLSearchParams({ frame: photo, mission: "AS" + mission, roll });
     return [
       {
-        title: item.title || term,
-        url: primary,
-        fallbackUrl: item.url && /^https:\/\//i.test(item.url) ? item.url : undefined,
+        title: String(meta.title),
+        url: original,
+        original,
         origin,
-        credit: item.creator || "Openverse Contributor",
-        license: item.license
-          ? `${item.license.toUpperCase()}${item.license_version ? " " + item.license_version : ""}`
-          : "CC",
-        provider: "openverse" as const,
+        credit: "NASA / " + id,
+        license: "Public domain (NASA mission photograph)",
+        description: caption.slice(0, 800),
+        provenance: "NASA mission archive",
+        publisherCaption: caption.slice(0, 1000),
       },
     ];
   });
 }
-
-export async function pictures(
+async function imageQueries(term: string) {
+  const english = await translateQuery(term).catch(() => term);
+  return { english, queries: [...new Set([term, english])] };
+}
+function imageQueryMatcher(queries: string[]) {
+  const terms = queries.map(normalize).filter(Boolean);
+  return (text: string) => {
+    const haystack = " " + normalize(text) + " ";
+    return Number(terms.some((term) => haystack.includes(" " + term + " ")));
+  };
+}
+async function discoverImagePosts(queries: string[]) {
+  const results = await Promise.all(
+    queries.map(async (query) => {
+      const language = /\p{Script=Arabic}/u.test(query) ? "ar" : "en";
+      let google: any[] = [];
+      try {
+        const result = await searxResponse(
+          query,
+          true,
+          language,
+          "google images",
+        );
+        google = (result.results || []).filter(
+          (item: any) => item.engine === "google images",
+        );
+        googleImagesStatus.error = google.length
+          ? undefined
+          : result.unresponsive_engines?.find(
+              ([engine]: string[]) => engine === "google images",
+            )?.[1] || "لا نتائج من Google Images";
+      } catch (error) {
+        googleImagesStatus.error = (error as Error).message;
+      }
+      googleImagesStatus.checkedAt = Date.now();
+      googleImagesStatus.count = google.length;
+      if (
+        google.some(
+          (item) =>
+            typeof item.img_src === "string" &&
+            !blockedImageOrigin(item.img_src, item.url),
+        )
+      )
+        return google;
+      const fallback = await searxResponse(
+        query,
+        true,
+        language,
+        "bing images,brave.images,duckduckgo images",
+      ).catch(() => null);
+      return fallback?.results || [];
+    }),
+  );
+  return results.map((group) =>
+    group.filter(
+      (r: any) =>
+        typeof r.img_src === "string" &&
+        typeof r.url === "string" &&
+        r.img_src.startsWith("https://") &&
+        r.url.startsWith("https://") &&
+        !blockedImageOrigin(r.img_src, r.url, r.thumbnail_src),
+    ),
+  );
+}
+export async function imagePosts(
   term: string,
-  source: "all" | "wikimedia" | "openverse" = "all",
-): Promise<ImageHit[]> {
-  const tasks: Promise<ImageHit[]>[] = [];
-  if (source === "all" || source === "wikimedia") {
-    tasks.push(wikimediaPictures(term).catch(() => []));
-  }
-  if (source === "all" || source === "openverse") {
-    tasks.push(openversePictures(term).catch(() => []));
-  }
-  const settled = await Promise.all(tasks);
-  const results: ImageHit[] = [];
-  const seen = new Set<string>();
-  // Interleave providers when both are present for resilience against single-host 429s
-  const maxLen = Math.max(...settled.map((s) => s.length), 0);
-  for (let i = 0; i < maxLen; i++) {
-    for (const list of settled) {
-      const hit = list[i];
-      if (hit && !seen.has(hit.url)) {
-        seen.add(hit.url);
-        results.push(hit);
-      }
-    }
-  }
-  return results;
+): Promise<
+  (Evidence & { preview?: string; rightsStatus: "unknown"; engine?: string })[]
+> {
+  const { queries } = await imageQueries(term);
+  const results = await discoverImagePosts(queries);
+  const mentions = imageQueryMatcher(queries);
+  return [
+    ...new Map(
+      results
+        .flatMap((group) => group.slice(0, 8))
+        .map((r: any) => [
+          r.url,
+          {
+            title: String(r.title || sourceHost(r.url)).slice(0, 230),
+            url: r.url,
+            text: sourceHost(r.url),
+            preview:
+              typeof r.thumbnail_src === "string" &&
+              r.thumbnail_src.startsWith("https://")
+                ? r.thumbnail_src
+                : r.img_src,
+            rightsStatus: "unknown" as const,
+            engine: typeof r.engine === "string" ? r.engine : undefined,
+          },
+        ]),
+    ).values(),
+  ].sort((a, b) => mentions(b.title) - mentions(a.title));
 }
 
-async function fetchImageUrlWithRetry(targetUrl: string): Promise<Buffer> {
-  const u = isSafePublicUrl(targetUrl);
-  const maxAttempts = 3;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    await paceHost(u.hostname, u.hostname === "upload.wikimedia.org" ? 450 : 250);
-    const r = await fetch(u, {
-      headers: headers(),
-      redirect: "follow",
-      signal: AbortSignal.timeout(25000),
-    });
-
-    if (r.status === 429 || r.status === 503) {
-      const retryAfterRaw = r.headers.get("retry-after");
-      const retrySec = retryAfterRaw ? Number(retryAfterRaw) : NaN;
-      const waitMs = Number.isFinite(retrySec)
-        ? Math.min(8000, Math.max(800, retrySec * 1000))
-        : 1200 * 2 ** attempt;
-      hostCooldownUntil.set(u.hostname, Date.now() + waitMs);
-      if (attempt < maxAttempts - 1 && (!Number.isFinite(retrySec) || retrySec <= 6)) {
-        await sleep(waitMs);
-        continue;
-      }
-      throw new Error(
-        `بلغ تنزيل الصور من ${u.hostname} حد الطلبات (429).` +
-          (retryAfterRaw ? " Retry-After: " + retryAfterRaw : ""),
+export async function pictures(term: string): Promise<ImageHit[]> {
+  const { english, queries } = await imageQueries(term);
+  const [archive, imageResults, open] = await Promise.all([
+    nasaArchive(english).catch(() => []),
+    discoverImagePosts(queries),
+    Promise.all(queries.map((query) => openverse(query).catch(() => []))),
+  ]);
+  const discovery = imageResults.flat();
+  const published = imageResults.flatMap((results) =>
+    results.slice(0, queries.length === 1 ? 4 : 2),
+  );
+  const inspected = await Promise.allSettled(
+    [
+      ...new Map(
+        published.map((r: any) => [r.url + "\n" + r.img_src, r]),
+      ).values(),
+    ].map(async (r: any) => {
+      const details = publisherLicense(
+        await articleBytes(r.url),
+        r.img_src,
+        r.url,
       );
-    }
-
-    if (!r.ok || !r.body) {
-      throw new Error("تعذر تنزيل الصورة " + r.status);
-    }
-
-    const ct = (r.headers.get("content-type") || "").toLowerCase();
-    if (!ct.startsWith("image/") || ct.includes("svg")) {
-      throw new Error("نوع الملف المسترجع ليس صورة صالحة: " + ct);
-    }
-
-    const chunks: Buffer[] = [];
-    let size = 0;
-    for await (const part of r.body as any) {
-      size += part.length;
-      if (size > 10e6) throw new Error("صورة كبيرة جدًا");
-      chunks.push(Buffer.from(part));
-    }
-    return Buffer.concat(chunks);
-  }
-  throw new Error("تعذر تنزيل الصورة بعد عدة محاولات");
+      return (
+        details && {
+          ...details,
+          publisherCaption: details.description,
+          title: String(r.title || ""),
+          url: r.img_src,
+          original: r.img_src,
+          origin: r.url,
+        }
+      );
+    }),
+  );
+  const hits = [
+    ...archive,
+    ...open.flat(),
+    ...inspected.flatMap((r) =>
+      r.status === "fulfilled" && r.value ? [r.value] : [],
+    ),
+  ];
+  const peers = new Set(discovery.flatMap((r: any) => [r.img_src, r.url]));
+  const mentions = imageQueryMatcher(queries);
+  return [
+    ...new Map(
+      hits
+        .filter(
+          (h) =>
+            reusable(h.license) &&
+            /^https:\/\//i.test(h.origin) &&
+            /^https:\/\//i.test(h.url),
+        )
+        .map((h) => [h.origin, h]),
+    ).values(),
+  ].sort(
+    (a, b) =>
+      mentions(b.title + " " + (b.description || "")) -
+        mentions(a.title + " " + (a.description || "")) ||
+      Number(peers.has(b.original) || peers.has(b.origin)) -
+        Number(peers.has(a.original) || peers.has(a.origin)),
+  );
 }
-
-export async function downloadHit(hit: Pick<ImageHit, "url" | "fallbackUrl">) {
+export async function downloadHit(hit: ImageHit) {
+  if (
+    blockedImageOrigin(
+      hit.origin,
+      hit.url,
+      hit.original,
+      hit.provenance,
+      hit.description,
+    )
+  )
+    throw Error("مصدر الصورة محظور");
+  if (!reusable(hit.license)) throw Error("ترخيص صورة غير مدعوم");
   try {
-    return await fetchImageUrlWithRetry(hit.url);
-  } catch (err) {
-    if (hit.fallbackUrl && hit.fallbackUrl !== hit.url) {
-      return await fetchImageUrlWithRetry(hit.fallbackUrl);
-    }
-    throw err;
+    return await publicImage(hit.original || hit.url, headers()["User-Agent"]);
+  } catch (e) {
+    if (!hit.original || hit.original === hit.url) throw e;
+    return publicImage(hit.url, headers()["User-Agent"]);
   }
 }

@@ -1,18 +1,12 @@
+import { blockedImageOrigin } from "./image-policy";
+import type { Fingerprint, QualityRejection } from "../shared/quality";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, statSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type {
-  Asset,
-  AssistantActionLog,
-  AssistantMessage,
-  Job,
-  Profile,
-  Question,
-} from "../shared/contracts";
+import type { Asset, Profile, Job, Question } from "../shared/contracts";
 
 export const uid = randomUUID;
-
 export function normalize(s: string) {
   return s
     .normalize("NFKC")
@@ -22,9 +16,8 @@ export function normalize(s: string) {
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
 }
-
 export function cosine(a: number[], b: number[]) {
-  if (a.length !== b.length || a.length === 0) return 0;
+  if (a.length !== b.length) return 0;
   let dot = 0,
     x = 0,
     y = 0;
@@ -35,48 +28,155 @@ export function cosine(a: number[], b: number[]) {
   }
   return dot / (Math.sqrt(x * y) || 1);
 }
-
 export class Store {
   db: DatabaseSync;
-  dbPath: string;
-
   constructor(dir: string) {
     mkdirSync(dir, { recursive: true });
-    this.dbPath = path.join(dir, "forge.sqlite");
-    this.db = new DatabaseSync(this.dbPath);
+    this.db = new DatabaseSync(path.join(dir, "forge.sqlite"));
     this.db.exec(`
-      PRAGMA foreign_keys=ON;
-      PRAGMA journal_mode=WAL;
-      PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS profiles(id TEXT PRIMARY KEY, body TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, meta TEXT NOT NULL, png BLOB NOT NULL);
-      CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, profile TEXT REFERENCES profiles(id), body TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY, profile TEXT REFERENCES profiles(id), norm TEXT NOT NULL, body TEXT NOT NULL, vector TEXT NOT NULL, UNIQUE(profile, norm));
-      CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS image_cache(url TEXT PRIMARY KEY, asset_id TEXT NOT NULL, created_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS assistant_messages(id TEXT PRIMARY KEY, profile TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, actions TEXT NOT NULL, created_at TEXT NOT NULL);
-    `);
-    if (!this.profile("default")) {
+ PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
+ CREATE TABLE IF NOT EXISTS profiles(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY,meta TEXT NOT NULL,png BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,profile TEXT REFERENCES profiles(id),body TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS quality_references(job TEXT NOT NULL REFERENCES jobs(id), url TEXT NOT NULL, PRIMARY KEY(job,url));
+ CREATE TABLE IF NOT EXISTS quality_research(job TEXT PRIMARY KEY,body TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS quality_fingerprints(question TEXT PRIMARY KEY,body TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS quality_accepted(job TEXT NOT NULL,fact TEXT NOT NULL,question TEXT NOT NULL,PRIMARY KEY(job,fact));
+ CREATE TABLE IF NOT EXISTS quality_audit(id INTEGER PRIMARY KEY,job TEXT NOT NULL,fact TEXT NOT NULL,stage TEXT NOT NULL,body TEXT NOT NULL,consumed INTEGER NOT NULL);
+ CREATE INDEX IF NOT EXISTS quality_audit_job ON quality_audit(job,stage);
+ CREATE TABLE IF NOT EXISTS search_cache(key TEXT PRIMARY KEY,body TEXT NOT NULL,expires INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS embedding_models(id TEXT PRIMARY KEY,model TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY,profile TEXT REFERENCES profiles(id),norm TEXT NOT NULL,body TEXT NOT NULL,vector TEXT NOT NULL,UNIQUE(profile,norm));`);
+    if (!this.profile("default"))
       this.saveProfile("default", {
         name: "لعبة المسابقات",
         rules: "",
         mapping: {},
       });
-    }
   }
-
+  fingerprint(id: string): Fingerprint | undefined {
+    const row = this.db
+      .prepare("SELECT body FROM quality_fingerprints WHERE question=?")
+      .get(id);
+    return row && JSON.parse(String(row.body));
+  }
+  saveFingerprint(id: string, fp: Fingerprint) {
+    this.db
+      .prepare("INSERT OR REPLACE INTO quality_fingerprints VALUES(?,?)")
+      .run(id, JSON.stringify(fp));
+  }
+  references(id: string) {
+    return this.db
+      .prepare(
+        "SELECT url FROM quality_references WHERE job=? ORDER BY rowid LIMIT 4",
+      )
+      .all(id)
+      .map((row) => String(row.url));
+  }
+  addReference(id: string, value: string) {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.port)
+      throw Error("يلزم رابط HTTPS عام للمصدر");
+    url.hash = "";
+    this.db
+      .prepare("INSERT OR IGNORE INTO quality_references(job,url) VALUES(?,?)")
+      .run(id, url.href);
+  }
+  researchState<T>(id: string): T | undefined {
+    const row = this.db
+      .prepare("SELECT body FROM quality_research WHERE job=?")
+      .get(id);
+    return row && JSON.parse(String(row.body));
+  }
+  saveResearchState(id: string, body: unknown) {
+    this.db
+      .prepare("INSERT OR REPLACE INTO quality_research VALUES(?,?)")
+      .run(id, JSON.stringify(body));
+  }
+  audit(id: string, fact: string, value: QualityRejection, consume = true) {
+    this.db
+      .prepare(
+        "INSERT INTO quality_audit(job,fact,stage,body,consumed) VALUES(?,?,?,?,?)",
+      )
+      .run(id, fact, value.stage, JSON.stringify(value), Number(consume));
+  }
+  usedFacts(id: string) {
+    return new Set(
+      this.db
+        .prepare(
+          "SELECT fact FROM quality_accepted WHERE job=? UNION SELECT fact FROM quality_audit WHERE job=? AND consumed=1",
+        )
+        .all(id, id)
+        .map((row) => String(row.fact)),
+    );
+  }
+  acceptFact(id: string, fact: string, question: string) {
+    this.db
+      .prepare("INSERT INTO quality_accepted VALUES(?,?,?)")
+      .run(id, fact, question);
+  }
+  acceptedQuestions(id: string) {
+    return this.db
+      .prepare(
+        "SELECT q.body FROM quality_accepted a JOIN questions q ON q.id=a.question WHERE a.job=?",
+      )
+      .all(id)
+      .map((row) => JSON.parse(String(row.body)) as Question);
+  }
+  qualityReport(id: string) {
+    const questions = this.acceptedQuestions(id);
+    const stages = this.db
+      .prepare(
+        "SELECT stage,COUNT(*) AS count FROM quality_audit WHERE job=? GROUP BY stage",
+      )
+      .all(id);
+    const counts = Object.fromEntries(
+      stages.map((row) => [String(row.stage), Number(row.count)]),
+    );
+    const rejected = Object.entries(counts).reduce(
+      (sum, [stage, count]) => sum + (stage === "image" ? 0 : count),
+      0,
+    );
+    const distribution = (values: string[]) => {
+      const counts: Record<string, number> = Object.create(null);
+      for (const value of values) counts[value] = (counts[value] || 0) + 1;
+      return counts;
+    };
+    return {
+      accepted: questions.length,
+      rejected,
+      retries: this.job(id)?.qualityRetries || 0,
+      intellectualRepeatRate:
+        rejected + questions.length
+          ? (counts.intellectual || 0) / (rejected + questions.length)
+          : 0,
+      rejectedByStage: counts,
+      difficulty: distribution(questions.map((q) => q.difficulty)),
+      types: distribution(
+        questions.map((q) => q.quality?.fingerprint.type || "unknown"),
+      ),
+      facets: distribution(questions.map((q) => q.quality?.facet || "unknown")),
+      sources: distribution(
+        questions.map((q) => q.quality?.sourceLabel || "unknown"),
+      ),
+      reasons: this.db
+        .prepare(
+          "SELECT body FROM quality_audit WHERE job=? ORDER BY id DESC LIMIT 60",
+        )
+        .all(id)
+        .map((row) => JSON.parse(String(row.body)) as QualityRejection),
+    };
+  }
   profile(id: string): Profile | undefined {
     const row = this.db.prepare("SELECT body FROM profiles WHERE id=?").get(id);
     return row && JSON.parse(String(row.body));
   }
-
-  profiles(): (Profile & { id: string })[] {
+  profiles() {
     return this.db
       .prepare("SELECT * FROM profiles")
       .all()
-      .map((r) => ({ id: String(r.id), ...JSON.parse(String(r.body)) }));
+      .map((r) => ({ id: r.id, ...JSON.parse(String(r.body)) }));
   }
-
   saveProfile(id: string, p: Profile) {
     this.db
       .prepare(
@@ -84,29 +184,16 @@ export class Store {
       )
       .run(id, JSON.stringify(p));
   }
-
-  deleteProfile(id: string) {
-    if (id === "default") throw new Error("لا يمكن حذف ملف اللعبة الافتراضي");
-    this.transaction(() => {
-      this.db.prepare("DELETE FROM questions WHERE profile=?").run(id);
-      this.db.prepare("DELETE FROM jobs WHERE profile=?").run(id);
-      this.db.prepare("DELETE FROM assistant_messages WHERE profile=?").run(id);
-      this.db.prepare("DELETE FROM profiles WHERE id=?").run(id);
-    });
-  }
-
   job(id: string): Job | undefined {
     const row = this.db.prepare("SELECT body FROM jobs WHERE id=?").get(id);
     return row && JSON.parse(String(row.body));
   }
-
   jobs(): Job[] {
     return this.db
       .prepare("SELECT body FROM jobs ORDER BY rowid")
       .all()
       .map((r) => JSON.parse(String(r.body)));
   }
-
   saveJob(j: Job) {
     this.db
       .prepare(
@@ -114,48 +201,94 @@ export class Store {
       )
       .run(j.id, j.profileId, JSON.stringify(j));
   }
-
   questions(id: string): Question[] {
     return this.db
       .prepare("SELECT body FROM questions WHERE profile=? ORDER BY rowid")
       .all(id)
       .map((r) => JSON.parse(String(r.body)));
   }
-
-  question(profileId: string, questionId: string): Question | undefined {
+  async reindex(
+    profile: string,
+    model: string,
+    embed: (s: string) => Promise<number[]>,
+  ) {
+    const rows = this.db
+      .prepare(
+        "SELECT q.id,q.body FROM questions q LEFT JOIN embedding_models m ON q.id=m.id WHERE profile=? AND (m.model IS NULL OR m.model<>?)",
+      )
+      .all(profile, model);
+    for (const row of rows) {
+      const vector = await embed(JSON.parse(String(row.body)).question);
+      this.transaction(() => {
+        this.db
+          .prepare("UPDATE questions SET vector=? WHERE id=?")
+          .run(JSON.stringify(vector), row.id);
+        this.db
+          .prepare("INSERT OR REPLACE INTO embedding_models VALUES(?,?)")
+          .run(row.id, model);
+      });
+    }
+  }
+  question(id: string, profile: string): Question | undefined {
     const row = this.db
       .prepare("SELECT body FROM questions WHERE id=? AND profile=?")
-      .get(questionId, profileId);
+      .get(id, profile);
     return row && JSON.parse(String(row.body));
   }
-
-  questionsWithVectors(
-    profileId: string,
-  ): { question: Question; norm: string; vector: number[] }[] {
-    return this.db
-      .prepare("SELECT norm, body, vector FROM questions WHERE profile=? ORDER BY rowid")
-      .all(profileId)
-      .map((r) => ({
-        question: JSON.parse(String(r.body)) as Question,
-        norm: String(r.norm),
-        vector: JSON.parse(String(r.vector)) as number[],
-      }));
+  setQuestionImage(q: Question, image: string) {
+    this.db
+      .prepare("UPDATE questions SET body=? WHERE id=? AND profile=?")
+      .run(JSON.stringify({ ...q, image }), q.id, q.profileId);
   }
-
-  duplicate(profile: string, text: string, v: number[], excludeId?: string) {
-    const targetNorm = normalize(text);
+  recentQuestions(profile: string) {
     return this.db
-      .prepare("SELECT id, norm, vector FROM questions WHERE profile=?")
+      .prepare(
+        "SELECT body FROM questions WHERE profile=? ORDER BY rowid DESC LIMIT 25",
+      )
       .all(profile)
-      .some((r) => {
-        if (excludeId && String(r.id) === excludeId) return false;
-        if (r.norm === targetNorm) return true;
-        const stored = JSON.parse(String(r.vector)) as number[];
-        return stored.length === v.length && cosine(v, stored) >= 0.92;
-      });
+      .map((row) => String(JSON.parse(String(row.body)).question));
   }
-
-  add(q: Question, v: number[]) {
+  duplicateIndex(profile: string) {
+    const names = new Set<string>();
+    const vectors: Float32Array[] = [];
+    const unit = (values: number[]) => {
+      const norm = Math.sqrt(values.reduce((sum, v) => sum + v * v, 0)) || 1;
+      return Float32Array.from(values, (v) => v / norm);
+    };
+    for (const row of this.db
+      .prepare("SELECT norm,vector FROM questions WHERE profile=?")
+      .iterate(profile)) {
+      names.add(String(row.norm));
+      vectors.push(unit(JSON.parse(String(row.vector))));
+    }
+    return {
+      has(text: string, values: number[]) {
+        if (names.has(normalize(text))) return true;
+        const next = unit(values);
+        return vectors.some((v) => {
+          if (v.length !== next.length) return false;
+          let dot = 0;
+          for (let i = 0; i < v.length; i++) dot += v[i] * next[i];
+          return dot >= 0.92;
+        });
+      },
+      add(text: string, values: number[]) {
+        names.add(normalize(text));
+        vectors.push(unit(values));
+      },
+    };
+  }
+  duplicate(profile: string, text: string, v: number[]) {
+    return this.db
+      .prepare("SELECT norm,vector FROM questions WHERE profile=?")
+      .all(profile)
+      .some(
+        (r) =>
+          r.norm === normalize(text) ||
+          cosine(v, JSON.parse(String(r.vector))) >= 0.92,
+      );
+  }
+  add(q: Question, v: number[], model?: string) {
     this.db
       .prepare("INSERT INTO questions VALUES(?,?,?,?,?)")
       .run(
@@ -165,176 +298,32 @@ export class Store {
         JSON.stringify(q),
         JSON.stringify(v),
       );
-  }
-
-  updateQuestion(profileId: string, q: Question, vector?: number[]) {
-    const norm = normalize(q.question);
-    const conflict = this.db
-      .prepare("SELECT id FROM questions WHERE profile=? AND norm=? AND id!=?")
-      .get(profileId, norm, q.id);
-    if (conflict) throw new Error("يوجد سؤال مطابق في نفس الملف");
-    if (vector) {
+    if (model)
       this.db
-        .prepare(
-          "UPDATE questions SET norm=?, body=?, vector=? WHERE id=? AND profile=?",
-        )
-        .run(norm, JSON.stringify(q), JSON.stringify(vector), q.id, profileId);
-    } else {
-      this.db
-        .prepare("UPDATE questions SET norm=?, body=? WHERE id=? AND profile=?")
-        .run(norm, JSON.stringify(q), q.id, profileId);
-    }
+        .prepare("INSERT INTO embedding_models VALUES(?,?)")
+        .run(q.id, model);
   }
-
-  updateQuestionVector(profileId: string, questionId: string, vector: number[]) {
-    this.db
-      .prepare("UPDATE questions SET vector=? WHERE id=? AND profile=?")
-      .run(JSON.stringify(vector), questionId, profileId);
-  }
-
-  deleteQuestion(profileId: string, questionId: string) {
-    return (
-      this.db
-        .prepare("DELETE FROM questions WHERE id=? AND profile=?")
-        .run(questionId, profileId).changes > 0
-    );
-  }
-
   assets(): Asset[] {
     return this.db
-      .prepare("SELECT meta FROM assets ORDER BY rowid DESC")
+      .prepare("SELECT meta FROM assets")
       .all()
       .map((r) => JSON.parse(String(r.meta)));
   }
-
-  assetMeta(id: string): Asset | undefined {
-    const r = this.db.prepare("SELECT meta FROM assets WHERE id=?").get(id);
-    return r && JSON.parse(String(r.meta));
+  canUseAsset(id: string) {
+    const row = this.db.prepare("SELECT meta FROM assets WHERE id=?").get(id);
+    if (!row) return false;
+    const asset = JSON.parse(String(row.meta)) as Asset;
+    return !blockedImageOrigin(asset.origin, asset.credit);
   }
-
   asset(id: string) {
     const r = this.db.prepare("SELECT png FROM assets WHERE id=?").get(id);
     return r && Buffer.from(r.png as Uint8Array);
   }
-
   putAsset(meta: Asset, png: Buffer) {
     this.db
       .prepare("INSERT INTO assets VALUES(?,?,?)")
       .run(meta.id, JSON.stringify(meta), png);
   }
-
-  getCachedAssetByUrl(url: string): Asset | undefined {
-    const row = this.db
-      .prepare("SELECT asset_id FROM image_cache WHERE url=?")
-      .get(url);
-    if (!row) return undefined;
-    const meta = this.assetMeta(String(row.asset_id));
-    return meta;
-  }
-
-  cacheAssetUrl(url: string, assetId: string) {
-    this.db
-      .prepare(
-        "INSERT INTO image_cache VALUES(?,?,?) ON CONFLICT(url) DO UPDATE SET asset_id=excluded.asset_id, created_at=excluded.created_at",
-      )
-      .run(url, assetId, new Date().toISOString());
-  }
-
-  getMeta(key: string): string | undefined {
-    const row = this.db.prepare("SELECT value FROM meta WHERE key=?").get(key);
-    return row ? String(row.value) : undefined;
-  }
-
-  setMeta(key: string, value: string) {
-    this.db
-      .prepare(
-        "INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      )
-      .run(key, value);
-  }
-
-  assistantHistory(profileId: string): AssistantMessage[] {
-    return this.db
-      .prepare(
-        "SELECT id, profile, role, content, actions, created_at FROM assistant_messages WHERE profile=? ORDER BY rowid ASC LIMIT 60",
-      )
-      .all(profileId)
-      .map((r) => ({
-        id: String(r.id),
-        profileId: String(r.profile),
-        role: String(r.role) as "user" | "assistant",
-        content: String(r.content),
-        actions: JSON.parse(String(r.actions)) as AssistantActionLog[],
-        createdAt: String(r.created_at),
-      }));
-  }
-
-  addAssistantMessage(
-    profileId: string,
-    role: "user" | "assistant",
-    content: string,
-    actions: AssistantActionLog[] = [],
-  ): AssistantMessage {
-    const msg: AssistantMessage = {
-      id: uid(),
-      profileId,
-      role,
-      content,
-      actions,
-      createdAt: new Date().toISOString(),
-    };
-    this.db
-      .prepare("INSERT INTO assistant_messages VALUES(?,?,?,?,?,?)")
-      .run(
-        msg.id,
-        profileId,
-        role,
-        content,
-        JSON.stringify(actions),
-        msg.createdAt,
-      );
-    return msg;
-  }
-
-  clearAssistantHistory(profileId: string) {
-    this.db
-      .prepare("DELETE FROM assistant_messages WHERE profile=?")
-      .run(profileId);
-  }
-
-  healthCheck() {
-    const check = this.db.prepare("PRAGMA quick_check").get() as
-      | Record<string, unknown>
-      | undefined;
-    const integrity = check ? Object.values(check)[0] === "ok" : false;
-    let sizeBytes = 0;
-    try {
-      sizeBytes = statSync(this.dbPath).size;
-    } catch {
-      sizeBytes = 0;
-    }
-    const counts = {
-      profiles: Number(
-        (this.db.prepare("SELECT COUNT(*) as c FROM profiles").get() as any)?.c ?? 0,
-      ),
-      questions: Number(
-        (this.db.prepare("SELECT COUNT(*) as c FROM questions").get() as any)?.c ?? 0,
-      ),
-      assets: Number(
-        (this.db.prepare("SELECT COUNT(*) as c FROM assets").get() as any)?.c ?? 0,
-      ),
-      jobs: Number(
-        (this.db.prepare("SELECT COUNT(*) as c FROM jobs").get() as any)?.c ?? 0,
-      ),
-    };
-    return {
-      integrity,
-      sizeBytes,
-      embedModel: this.getMeta("embed_model") || null,
-      counts,
-    };
-  }
-
   transaction(fn: () => void) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -346,3 +335,5 @@ export class Store {
     }
   }
 }
+
+export type QualityReport = ReturnType<Store["qualityReport"]>;
