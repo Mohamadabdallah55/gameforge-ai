@@ -1,7 +1,13 @@
+import { blockedImageOrigin } from "./image-policy";
 import ExcelJS from "exceljs";
 import JSZip from "jszip";
 import { parse } from "csv-parse/sync";
-import { fields, type Profile } from "../shared/contracts";
+import {
+  difficultyPoints,
+  fields,
+  type Profile,
+  type Question,
+} from "../shared/contracts";
 import { Store, normalize } from "./store";
 const aliases = {
   question: ["question", "prompt", "السؤال", "سؤال"],
@@ -65,14 +71,27 @@ export async function infer(format: string, bytes: Buffer) {
     rows: rows.length,
   };
 }
-export async function output(db: Store, id: string, format: string) {
+export async function output(
+  db: Store,
+  id: string,
+  format: string,
+  questions?: Question[],
+) {
   const profile = db.profile(id);
   if (!profile) throw new Error("ملف اللعبة غير موجود");
-  const qs = db.questions(id),
+  const qs = questions || db.questions(id),
     headers = fields.map((f) => profile.mapping[f] ?? f);
+  const safeAssets = db
+    .assets()
+    .filter((a) => !blockedImageOrigin(a.origin, a.credit));
+  const safeIds = new Set(safeAssets.map((a) => a.id));
   const rows = qs.map((q) =>
     fields.map((f) =>
-      f === "image" ? (q.image ? "images/" + q.image + ".png" : "") : q[f],
+      f === "image"
+        ? q.image && safeIds.has(q.image)
+          ? "images/" + q.image + ".png"
+          : ""
+        : q[f],
     ),
   );
   const json = JSON.stringify(
@@ -102,13 +121,19 @@ export async function output(db: Store, id: string, format: string) {
   const zip = new JSZip();
   zip.file("questions.json", json);
   const used = new Set(qs.map((q) => q.image).filter(Boolean));
-  const assets = db.assets().filter((a) => used.has(a.id));
+  const assets = safeAssets.filter((a) => used.has(a.id));
   for (const a of assets) zip.file("images/" + a.id + ".png", db.asset(a.id)!);
   zip.file("credits.json", JSON.stringify(assets, null, 2));
   zip.file(
     "evidence.json",
     JSON.stringify(
-      qs.map((q) => ({ question: q.question, url: q.source, quote: q.quote })),
+      qs.map((q) => ({
+        question: q.question,
+        url: q.source,
+        quote: q.quote,
+        difficultyPoints: difficultyPoints[q.difficulty],
+        quality: q.quality,
+      })),
       null,
       2,
     ),
